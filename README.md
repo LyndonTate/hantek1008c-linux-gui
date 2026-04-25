@@ -45,6 +45,15 @@ pip install -r requirements.txt
 python3 main.py
 ```
 
+## Known limitations
+
+- Rising edge trigger only (falling edge not yet implemented)
+- No roll mode (continuous scrolling for slow signals)
+- No automatic measurements (Vpp, frequency, RMS, etc.)
+- No measurement cursors
+- No waveform export (CSV, image, etc.)
+- Trigger mode is normal only (no auto-trigger or single-shot)
+
 ## Project structure
 
 ```
