@@ -1,0 +1,8 @@
+hantek1008c-linux-gui
+
+This product includes software derived from hantek1008py by Mathias Graßmann (mfg92):
+  https://github.com/mfg92/hantek1008py
+  Licensed under the Apache License, Version 2.0
+
+The file vendor/hantek1008.py is derived from that project and has been modified.
+See LICENSE for the full text of the Apache License 2.0.
