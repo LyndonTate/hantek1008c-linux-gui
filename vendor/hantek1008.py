@@ -67,6 +67,13 @@ class Hantek1008Raw:
     # eg. 10, 2000 or 5. Maximum is 200_000_000
     # a div contains around 25 samples
     __burst_mode_ns_per_div_to_id_dic = {({0: 1, 1: 2, 2: 5}[id % 3] * 10 ** (id // 3)): id for id in range(26)}
+    # The Windows vendor app maps 200µs to a30f (fast-fixed mode at the device's
+    # max sample rate). Our generated table maps 200µs to a310 — the same submode
+    # as 500µs (a311 in our table), which makes 200µs visually indistinguishable
+    # from 500µs. Override 200µs to match Windows: send a30f and treat it as
+    # fast-fixed (see _FAST_FIXED_NS_PER_DIV_MAX). 100µs and below already use
+    # fast-fixed and are unchanged.
+    __burst_mode_ns_per_div_to_id_dic[200_000] = 0x0f
 
     def __init__(self, ns_per_div: int = 500_000,
                  vertical_scale_factor: Union[float, List[float]] = 1.0,
@@ -492,7 +499,26 @@ class Hantek1008Raw:
     # each — using slow-burst's B_SUM=5002 here causes the device to sample at the
     # wrong rate (cycles appear scaled by ~5002/1668 ≈ 3x).
     _FAST_FIXED_B = 0x000342  # 834 — sample-rate divider word (constant in Windows pcap)
-    _FAST_FIXED_NS_PER_DIV_MAX = 100_000
+    _FAST_FIXED_NS_PER_DIV_MAX = 200_000  # 200µs..1ns are fast-fixed (200µs uses a30f)
+
+    # Slow-burst sample-rate B_SUM by ns_per_div. The 0xac payload's two 24-bit B
+    # fields always sum to a constant per a3 ID — that constant encodes the ADC
+    # sample period. Empirically (matching the rate observed at 500µs with our
+    # A=4032 default) the relationship is B_SUM ≈ ns_per_div / 100, which keeps
+    # the captured 4000 samples spanning exactly 10×ns_per_div of real time:
+    #   500µs  -> 5000   (vendor sends 5002, ±2 firmware-internal tolerance)
+    #   1ms    -> 10000
+    #   2ms    -> 20000
+    #   5ms    -> 50000
+    #   10ms   -> 100000  (vendor: 100494)
+    #   20ms   -> 200000  (vendor: 200293)
+    # For 200µs we send 2000 (vendor uses 1402 which under-samples at ~1.4µs/sample;
+    # 2000 → 500ns/sample so the full 4000-sample buffer covers the 2000µs window).
+    # Using the constant 5002 unconditionally caused 200µs to display identically
+    # to 500µs because the device sampled at the 500µs rate regardless of a3 ID.
+    @staticmethod
+    def _slow_burst_b_sum(ns_per_div: int) -> int:
+        return max(2, ns_per_div // 100)
 
     def _is_fast_fixed_mode(self) -> bool:
         return self.__ns_per_div <= Hantek1008Raw._FAST_FIXED_NS_PER_DIV_MAX
@@ -530,11 +556,16 @@ class Hantek1008Raw:
         max_pre = 4000 // n_ch          # samples per channel the hardware can buffer
         capped = min(pre_samples, max_pre)
         A = max(400, min(7520, 2 * capped))
-        B_SUM = 5002
+        B_SUM = Hantek1008Raw._slow_burst_b_sum(self.__ns_per_div)
+        # B1 places the trigger event proportionally inside the captured window;
+        # at A=4000 the split is centered (B1 = B_SUM/2). The 4000 reference is the
+        # full hardware buffer, not B_SUM, so the same fraction works for any rate.
+        half = B_SUM // 2
         if A <= 4000:
-            B1 = math.ceil(A * 2501 / 4000)
+            B1 = math.ceil(A * half / 4000)
         else:
-            B1 = A * 2501 // 4000
+            B1 = A * half // 4000
+        B1 = max(0, min(B_SUM, B1))
         B2 = B_SUM - B1
         payload = A.to_bytes(2, 'big') + B1.to_bytes(3, 'big') + B2.to_bytes(3, 'big')
         log.info("AC[slow-burst] ns/div=%d pre_req=%d n_ch=%d A=%d B1=%d B2=%d -> payload=%s",

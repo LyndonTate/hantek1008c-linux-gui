@@ -15,10 +15,16 @@ TIME_DIVS = 10
 VOLT_DIVS = 8
 GRID_COLOR = "#2a2a2a"
 ADC_MIN_NS_PER_SAMPLE = 416  # slow-burst max sample rate (~2.4 MSa/s)
-# At ns_per_div <= 100us the device runs in "fast-fixed" mode and always returns
-# 4000 samples that span the full 10-div window (sample period = ns_per_div/400,
-# e.g. 250 ns at 100us/div). The 416 ns clamp does not apply in this mode.
-FAST_FIXED_NS_PER_DIV_MAX = 100_000
+# At ns_per_div <= 200us the device runs in "fast-fixed" mode where the ADC
+# samples at its max rate (~416 ns/sample) regardless of the requested ns/div.
+# At ≤100us the requested rate exceeds 416ns so the buffer fits inside one
+# screen and the 416 clamp matches both the device and the display formula.
+# At 200us the requested rate (500ns) is slower than 416, but the device still
+# samples at 416 — so the 4000-sample buffer covers only 1664us, less than the
+# 2000us labeled window. We must clamp to 416 unconditionally in this mode and
+# size the grid by samples_per_div = ns_per_div / 416 so the displayed width
+# matches reality (a partial right-edge div is preferable to stretching).
+FAST_FIXED_NS_PER_DIV_MAX = 200_000
 
 # Maps user-facing display V/div to the 3 hardware gain settings
 _HW_VSCALE_BREAKPOINTS = [(0.05, 0.02), (0.5, 0.125)]
@@ -240,22 +246,40 @@ class ScopeWindow(QMainWindow):
             self._trigger_marker.setValue(self._trigger_level_volts + new_offset)
             self._trigger_marker.blockSignals(False)
 
+    def _compute_display_geometry(self, frame_size, ns_per_div):
+        """Return (display_samples, samples_per_div) for the current timebase.
+
+        samples_per_div is the float number of buffer samples that span exactly
+        one labeled time-division at the device's actual sample period. The X
+        axis grid uses this for its step so each grid square always represents
+        ns_per_div of real time.
+
+        display_samples is how many samples we render. When the buffer can hold
+        the full 10-div window we render 10×samples_per_div. When it can't
+        (fast-fixed mode at ≥200us, where the 4000-sample buffer covers
+        ~1664us at the fixed 416 ns/sample rate), we render only the integer
+        number of full divs that fit, so the labeled width stays accurate and
+        no partial sample-stretching is needed.
+        """
+        if ns_per_div <= FAST_FIXED_NS_PER_DIV_MAX:
+            actual_ns_per_sample = ADC_MIN_NS_PER_SAMPLE
+        else:
+            requested_ns_per_sample = (ns_per_div * TIME_DIVS) / frame_size
+            actual_ns_per_sample = max(requested_ns_per_sample, ADC_MIN_NS_PER_SAMPLE)
+        samples_per_div = ns_per_div / actual_ns_per_sample
+        full_divs = min(TIME_DIVS, int(frame_size // samples_per_div))
+        display_samples = max(1, int(full_divs * samples_per_div))
+        return display_samples, samples_per_div
+
     def _compute_display_samples(self, frame_size, ns_per_div):
-        # In fast-fixed mode the device runs at the ADC max rate (~416 ns/sample)
-        # and returns 4000 samples spanning ~1668 µs regardless of the requested
-        # ns_per_div, so the same clamp the slow-burst path uses is what we want
-        # here too — it returns just the subset that corresponds to 10 × ns_per_div
-        # of real time.
-        requested_ns_per_sample = (ns_per_div * TIME_DIVS) / frame_size
-        actual_ns_per_sample = max(requested_ns_per_sample, ADC_MIN_NS_PER_SAMPLE)
-        return min(int((ns_per_div * TIME_DIVS) / actual_ns_per_sample), frame_size)
+        return self._compute_display_geometry(frame_size, ns_per_div)[0]
 
     def _init_buffer(self, frame_size):
         ns_per_div = self._controls.get_ns_per_div()
         old_display_samples = self._display_samples
-        self._display_samples = self._compute_display_samples(frame_size, ns_per_div)
-        log.info("_init_buffer: ns/div=%d frame_size=%d -> display_samples=%d (was %d)",
-                 ns_per_div, frame_size, self._display_samples, old_display_samples)
+        self._display_samples, samples_per_div = self._compute_display_geometry(frame_size, ns_per_div)
+        log.info("_init_buffer: ns/div=%d frame_size=%d -> display_samples=%d samples_per_div=%.2f (was display=%d)",
+                 ns_per_div, frame_size, self._display_samples, samples_per_div, old_display_samples)
         is_first_init = self._frame_size == 0
         self._frame_size = frame_size
         self._last_frame_np = {}
@@ -282,9 +306,12 @@ class ScopeWindow(QMainWindow):
         for line in self._v_grid_lines:
             pi.removeItem(line)
         self._v_grid_lines.clear()
-        x_step = self._display_samples / TIME_DIVS
+        x_step = samples_per_div
         for i in range(1, TIME_DIVS):
-            line = pg.InfiniteLine(pos=i * x_step, angle=90, pen=grid_pen, movable=False)
+            pos = i * x_step
+            if pos >= self._display_samples:
+                break
+            line = pg.InfiniteLine(pos=pos, angle=90, pen=grid_pen, movable=False)
             pi.addItem(line)
             self._v_grid_lines.append(line)
 
