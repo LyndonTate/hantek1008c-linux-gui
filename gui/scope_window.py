@@ -1,6 +1,9 @@
 import sys
+import logging
 import numpy as np
 import pyqtgraph as pg
+
+log = logging.getLogger(__name__)
 from PyQt6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QApplication
 from PyQt6.QtCore import Qt
 
@@ -11,7 +14,11 @@ from gui.channel_margin import ChannelMarginWidget
 TIME_DIVS = 10
 VOLT_DIVS = 8
 GRID_COLOR = "#2a2a2a"
-ADC_MIN_NS_PER_SAMPLE = 416  # hardware max sample rate (~2.4 MSa/s)
+ADC_MIN_NS_PER_SAMPLE = 416  # slow-burst max sample rate (~2.4 MSa/s)
+# At ns_per_div <= 100us the device runs in "fast-fixed" mode and always returns
+# 4000 samples that span the full 10-div window (sample period = ns_per_div/400,
+# e.g. 250 ns at 100us/div). The 416 ns clamp does not apply in this mode.
+FAST_FIXED_NS_PER_DIV_MAX = 100_000
 
 # Maps user-facing display V/div to the 3 hardware gain settings
 _HW_VSCALE_BREAKPOINTS = [(0.05, 0.02), (0.5, 0.125)]
@@ -28,8 +35,11 @@ def _pad_channels_to_pairs(channels: list) -> list:
     """Ensure active channels always come in hardware pairs (0,1), (2,3), (4,5), (6,7).
 
     The Hantek 1008C firmware crashes if an odd-numbered channel count other than 1
-    is sent.  Any enabled channel in a pair forces its partner on as well.
+    is sent.  A single active channel is allowed (Windows sends count=1 directly),
+    so only pad when there are 3, 5, or 7 active channels.
     """
+    if len(channels) <= 1:
+        return sorted(channels)
     padded = set(channels)
     for ch in list(padded):
         padded.add(ch ^ 1)  # partner: 0↔1, 2↔3, 4↔5, 6↔7
@@ -175,12 +185,30 @@ class ScopeWindow(QMainWindow):
     def _on_h_trigger_moved(self):
         pos = int(self._h_trigger_marker.value())
         self._acq.queue_hw_trigger_pre_samples(pos)
+        # In fast-fixed mode the marker is realised in software (see _redraw),
+        # so repaint immediately for snappy feedback.
+        if self._last_frame_np:
+            self._redraw()
 
     def _redraw(self):
+        ns = self._controls.get_ns_per_div()
+        if ns <= FAST_FIXED_NS_PER_DIV_MAX and self._frame_size > self._display_samples:
+            # Fast-fixed mode: the device always puts the trigger event in the
+            # middle of its 4000-sample buffer (B1=B2 in the AC payload), so
+            # changing pre_samples has no hardware effect. Slide the display
+            # window in software instead so the trigger lines up with the
+            # user's H-trigger marker.
+            hw_trigger_idx = self._frame_size // 2
+            h_marker = int(self._h_trigger_marker.value())
+            start = hw_trigger_idx - h_marker
+            start = max(0, min(start, self._frame_size - self._display_samples))
+            end = start + self._display_samples
+        else:
+            start, end = 0, self._display_samples
         for ch_id, samples in self._last_frame_np.items():
             if ch_id not in self._channel_data:
                 continue
-            self._channel_data[ch_id]["curve"].setData(samples[:self._display_samples])
+            self._channel_data[ch_id]["curve"].setData(samples[start:end])
 
     def _volts_to_adc(self, volts, display_vscale, channel_id):
         hw_vscale = _hw_vscale_for(display_vscale)
@@ -213,6 +241,11 @@ class ScopeWindow(QMainWindow):
             self._trigger_marker.blockSignals(False)
 
     def _compute_display_samples(self, frame_size, ns_per_div):
+        # In fast-fixed mode the device runs at the ADC max rate (~416 ns/sample)
+        # and returns 4000 samples spanning ~1668 µs regardless of the requested
+        # ns_per_div, so the same clamp the slow-burst path uses is what we want
+        # here too — it returns just the subset that corresponds to 10 × ns_per_div
+        # of real time.
         requested_ns_per_sample = (ns_per_div * TIME_DIVS) / frame_size
         actual_ns_per_sample = max(requested_ns_per_sample, ADC_MIN_NS_PER_SAMPLE)
         return min(int((ns_per_div * TIME_DIVS) / actual_ns_per_sample), frame_size)
@@ -221,6 +254,8 @@ class ScopeWindow(QMainWindow):
         ns_per_div = self._controls.get_ns_per_div()
         old_display_samples = self._display_samples
         self._display_samples = self._compute_display_samples(frame_size, ns_per_div)
+        log.info("_init_buffer: ns/div=%d frame_size=%d -> display_samples=%d (was %d)",
+                 ns_per_div, frame_size, self._display_samples, old_display_samples)
         is_first_init = self._frame_size == 0
         self._frame_size = frame_size
         self._last_frame_np = {}
@@ -363,6 +398,7 @@ class ScopeWindow(QMainWindow):
         self._redraw()
 
     def _on_time_div_changed(self, ns):
+        log.info("===== USER changed time/div -> %d ns/div =====", ns)
         self._restart_acquisition()
 
     def _on_channel_toggled(self, ch_idx, is_on):
