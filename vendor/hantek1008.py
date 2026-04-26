@@ -332,7 +332,7 @@ class Hantek1008Raw:
         # activate all 8 channels
         self.__send_set_active_channels(Hantek1008Raw.valid_channel_ids())
 
-        self.__send_set_time_div(500 * 1000)  # 500us, the default value in the windows software
+        self.__send_set_time_div(self.__ns_per_div)  # use configured value, not hardcoded 500us
 
         self.__send_set_trigger(0, "rising")
 
@@ -509,8 +509,8 @@ class Hantek1008Raw:
         """Reconfigure the device without a full reinit (no USB reset, no 0xb0).
 
         Safe to call while the device is idle (between burst cycles or after the
-        acquisition thread has been stopped).  Matches the minimal sequence the
-        vendor software uses when toggling channels: a0, aa, a2, ac, f3 (ping).
+        acquisition thread has been stopped).  Sends: a0, aa (channels), a2
+        (vscales), a3 (time div), c1 (trigger), ac (pre-trigger depth), f3 (ping).
         """
         self.__active_channels = sorted(copy.deepcopy(active_channels))
         self.__vertical_scale_factors = copy.deepcopy(vscales)
@@ -525,10 +525,30 @@ class Hantek1008Raw:
         with self.__trigger_level_lock:
             self.__pending_trigger_level = None
 
+        # Mirror _init3 exactly: preamble, first a3 + commit, channels/vscales, second a3 + trigger.
+        self.__send_cmd(0xf6, sec_till_response_request=0.2132)
+        self.__send_cmd(0xe5, echo_expected=False, response_length=2)
+        self.__send_cmd(0xf7, echo_expected=False, response_length=64)
+        self.__send_cmd(0xf8, echo_expected=False, response_length=64)
+        self.__send_cmd(0xfa, echo_expected=False, response_length=56)
+
+        # First a3 + commit sequence (matches _init3: a3 → small ac → e4 → e6 → f3)
+        self.__send_set_time_div(self.__ns_per_div)
+        self.__send_cmd(0xac, parameter=bytes.fromhex("00c80002bd0002bd"))
+        self.__send_cmd(0xe4, parameter=[0x01])
+        self.__send_cmd(0xe6, parameter=[0x01], echo_expected=False, response_length=10)
+        self.__send_ping()
+
+        # Channel and vscale setup
         self.__send_set_active_channels(self.__active_channels)
         self.__send_set_vertical_scale(self.__vertical_scale_factors)
+
+        # Second a3 + full trigger setup
+        self.__send_set_time_div(self.__ns_per_div)
         self.__send_set_trigger(self.__trigger_channel, self.__trigger_slope)
+        self.__send_cmd(0xa7, parameter=[0x00, 0x00], response_length=1)
         self.__send_cmd(0xac, parameter=self._hw_trigger_ac_payload(pre_samples))
+        self.__send_set_trigger_level(self.__trigger_level)
         self.__send_ping()
 
     @staticmethod

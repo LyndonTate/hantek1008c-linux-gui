@@ -11,7 +11,7 @@ from gui.channel_margin import ChannelMarginWidget
 TIME_DIVS = 10
 VOLT_DIVS = 8
 GRID_COLOR = "#2a2a2a"
-ADC_MIN_NS_PER_SAMPLE = 416  # empirically measured hardware limit (~2.4 MSa/s)
+ADC_MIN_NS_PER_SAMPLE = 416  # hardware max sample rate (~2.4 MSa/s)
 
 # Maps user-facing display V/div to the 3 hardware gain settings
 _HW_VSCALE_BREAKPOINTS = [(0.05, 0.02), (0.5, 0.125)]
