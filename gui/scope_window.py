@@ -14,17 +14,21 @@ from gui.channel_margin import ChannelMarginWidget
 TIME_DIVS = 10
 VOLT_DIVS = 8
 GRID_COLOR = "#2a2a2a"
-ADC_MIN_NS_PER_SAMPLE = 416  # slow-burst max sample rate (~2.4 MSa/s)
-# At ns_per_div <= 200us the device runs in "fast-fixed" mode where the ADC
+ADC_MIN_NS_PER_SAMPLE = 416  # fast-fixed max sample rate (~2.4 MSa/s)
+# In slow-burst mode (ns/div ≥ 200µs) the device clocks its 4000-short buffer at
+# a fixed rate of ~1250 ns/sample regardless of the ac-payload's B_SUM field.
+# Empirically: at 500µs/div the 4000-sample buffer spans exactly 5000µs (10
+# divs), confirming the rate. At 200µs/div the same buffer still spans 5000µs
+# (= 25 divs at 200µs), so the GUI must display only 1600 of the 4000 samples
+# to render the labeled 10-div window. B_SUM (which only changes for 200µs in
+# Windows captures, to 1402) doesn't actually move the rate — the device clamps
+# to its slow-burst clock floor.
+SLOW_BURST_NS_PER_SAMPLE = 1250
+# At ns_per_div <= 100us the device runs in "fast-fixed" mode where the ADC
 # samples at its max rate (~416 ns/sample) regardless of the requested ns/div.
 # At ≤100us the requested rate exceeds 416ns so the buffer fits inside one
 # screen and the 416 clamp matches both the device and the display formula.
-# At 200us the requested rate (500ns) is slower than 416, but the device still
-# samples at 416 — so the 4000-sample buffer covers only 1664us, less than the
-# 2000us labeled window. We must clamp to 416 unconditionally in this mode and
-# size the grid by samples_per_div = ns_per_div / 416 so the displayed width
-# matches reality (a partial right-edge div is preferable to stretching).
-FAST_FIXED_NS_PER_DIV_MAX = 200_000
+FAST_FIXED_NS_PER_DIV_MAX = 100_000
 
 # Maps user-facing display V/div to the 3 hardware gain settings
 _HW_VSCALE_BREAKPOINTS = [(0.05, 0.02), (0.5, 0.125)]
@@ -198,12 +202,14 @@ class ScopeWindow(QMainWindow):
 
     def _redraw(self):
         ns = self._controls.get_ns_per_div()
-        if ns <= FAST_FIXED_NS_PER_DIV_MAX and self._frame_size > self._display_samples:
-            # Fast-fixed mode: the device always puts the trigger event in the
-            # middle of its 4000-sample buffer (B1=B2 in the AC payload), so
-            # changing pre_samples has no hardware effect. Slide the display
-            # window in software instead so the trigger lines up with the
-            # user's H-trigger marker.
+        if self._frame_size > self._display_samples:
+            # The captured buffer is larger than the labeled time window — true
+            # in fast-fixed mode at low ns/div AND in slow-burst at 200µs (where
+            # the 4000-sample buffer's 5000µs span exceeds the 2000µs label).
+            # The hardware always centers the trigger event in its 4000-sample
+            # buffer when we send a centered ac payload (A=4000, B1=B2), so
+            # slide the display window so the trigger event lines up with the
+            # user's H-trigger marker on screen.
             hw_trigger_idx = self._frame_size // 2
             h_marker = int(self._h_trigger_marker.value())
             start = hw_trigger_idx - h_marker
@@ -265,7 +271,11 @@ class ScopeWindow(QMainWindow):
             actual_ns_per_sample = ADC_MIN_NS_PER_SAMPLE
         else:
             requested_ns_per_sample = (ns_per_div * TIME_DIVS) / frame_size
-            actual_ns_per_sample = max(requested_ns_per_sample, ADC_MIN_NS_PER_SAMPLE)
+            # Slow-burst can't sample faster than SLOW_BURST_NS_PER_SAMPLE — at
+            # 200µs the requested 500ns/sample exceeds the device's 1250ns/sample
+            # floor, so we display fewer samples than frame_size to keep the
+            # labeled width accurate.
+            actual_ns_per_sample = max(requested_ns_per_sample, SLOW_BURST_NS_PER_SAMPLE)
         samples_per_div = ns_per_div / actual_ns_per_sample
         full_divs = min(TIME_DIVS, int(frame_size // samples_per_div))
         display_samples = max(1, int(full_divs * samples_per_div))

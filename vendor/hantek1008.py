@@ -67,13 +67,6 @@ class Hantek1008Raw:
     # eg. 10, 2000 or 5. Maximum is 200_000_000
     # a div contains around 25 samples
     __burst_mode_ns_per_div_to_id_dic = {({0: 1, 1: 2, 2: 5}[id % 3] * 10 ** (id // 3)): id for id in range(26)}
-    # The Windows vendor app maps 200µs to a30f (fast-fixed mode at the device's
-    # max sample rate). Our generated table maps 200µs to a310 — the same submode
-    # as 500µs (a311 in our table), which makes 200µs visually indistinguishable
-    # from 500µs. Override 200µs to match Windows: send a30f and treat it as
-    # fast-fixed (see _FAST_FIXED_NS_PER_DIV_MAX). 100µs and below already use
-    # fast-fixed and are unchanged.
-    __burst_mode_ns_per_div_to_id_dic[200_000] = 0x0f
 
     def __init__(self, ns_per_div: int = 500_000,
                  vertical_scale_factor: Union[float, List[float]] = 1.0,
@@ -499,7 +492,7 @@ class Hantek1008Raw:
     # each — using slow-burst's B_SUM=5002 here causes the device to sample at the
     # wrong rate (cycles appear scaled by ~5002/1668 ≈ 3x).
     _FAST_FIXED_B = 0x000342  # 834 — sample-rate divider word (constant in Windows pcap)
-    _FAST_FIXED_NS_PER_DIV_MAX = 200_000  # 200µs..1ns are fast-fixed (200µs uses a30f)
+    _FAST_FIXED_NS_PER_DIV_MAX = 100_000  # 100µs..1ns are fast-fixed (200µs is slow-burst)
 
     # Slow-burst sample-rate B_SUM by ns_per_div. The 0xac payload's two 24-bit B
     # fields always sum to a constant per a3 ID — that constant encodes the ADC
@@ -512,12 +505,22 @@ class Hantek1008Raw:
     #   5ms    -> 50000
     #   10ms   -> 100000  (vendor: 100494)
     #   20ms   -> 200000  (vendor: 200293)
-    # For 200µs we send 2000 (vendor uses 1402 which under-samples at ~1.4µs/sample;
-    # 2000 → 500ns/sample so the full 4000-sample buffer covers the 2000µs window).
-    # Using the constant 5002 unconditionally caused 200µs to display identically
-    # to 500µs because the device sampled at the 500µs rate regardless of a3 ID.
+    # 200µs is special: Windows always sends B_SUM=1402 (NOT the formula's 2000).
+    # The device's slow-burst sample rate is fixed at ~1250ns/sample regardless
+    # of B_SUM, so the 4000-short buffer always spans 5000µs (the 500µs window).
+    # At 200µs the GUI displays only the centered 1600 samples (= 2000µs) of
+    # this buffer — hence A is forced to 4000 here so the trigger event always
+    # lands at buffer center, allowing the GUI to slide the displayed 1600-
+    # sample window in software (matching how fast-fixed handles trigger-marker
+    # movement). Windows itself varies A at 200µs, but with our software-slide
+    # display it's simpler and equally functional to fix A=4000.
+    _SLOW_BURST_B_SUM_OVERRIDES = {200_000: 1402}
+    _SLOW_BURST_A_OVERRIDES = {200_000: 4000}
+
     @staticmethod
     def _slow_burst_b_sum(ns_per_div: int) -> int:
+        if ns_per_div in Hantek1008Raw._SLOW_BURST_B_SUM_OVERRIDES:
+            return Hantek1008Raw._SLOW_BURST_B_SUM_OVERRIDES[ns_per_div]
         return max(2, ns_per_div // 100)
 
     def _is_fast_fixed_mode(self) -> bool:
@@ -555,16 +558,24 @@ class Hantek1008Raw:
         n_ch = max(1, len(self.__active_channels))
         max_pre = 4000 // n_ch          # samples per channel the hardware can buffer
         capped = min(pre_samples, max_pre)
-        A = max(400, min(7520, 2 * capped))
         B_SUM = Hantek1008Raw._slow_burst_b_sum(self.__ns_per_div)
-        # B1 places the trigger event proportionally inside the captured window;
-        # at A=4000 the split is centered (B1 = B_SUM/2). The 4000 reference is the
-        # full hardware buffer, not B_SUM, so the same fraction works for any rate.
-        half = B_SUM // 2
-        if A <= 4000:
-            B1 = math.ceil(A * half / 4000)
+        if self.__ns_per_div in Hantek1008Raw._SLOW_BURST_A_OVERRIDES:
+            # Device-required fixed buffer size for this time-base. Trigger
+            # position is encoded purely in B1/B2 split (max_pre = 4000 maps to
+            # full B_SUM range, centered = B_SUM/2).
+            A = Hantek1008Raw._SLOW_BURST_A_OVERRIDES[self.__ns_per_div]
+            pre_frac = capped / max_pre  # 0.0..1.0, 0.5 = centered trigger
+            B1 = int(round(pre_frac * B_SUM))
         else:
-            B1 = A * half // 4000
+            A = max(400, min(7520, 2 * capped))
+            # B1 places the trigger event proportionally inside the captured window;
+            # at A=4000 the split is centered (B1 = B_SUM/2). The 4000 reference is the
+            # full hardware buffer, not B_SUM, so the same fraction works for any rate.
+            half = B_SUM // 2
+            if A <= 4000:
+                B1 = math.ceil(A * half / 4000)
+            else:
+                B1 = A * half // 4000
         B1 = max(0, min(B_SUM, B1))
         B2 = B_SUM - B1
         payload = A.to_bytes(2, 'big') + B1.to_bytes(3, 'big') + B2.to_bytes(3, 'big')
