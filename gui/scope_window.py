@@ -30,6 +30,54 @@ SLOW_BURST_NS_PER_SAMPLE = 1250
 # screen and the 416 clamp matches both the device and the display formula.
 FAST_FIXED_NS_PER_DIV_MAX = 100_000
 
+# When the display window contains few samples (fast-fixed mode at low ns/div),
+# the polyline between widely-spaced points becomes visibly jagged AND the raw
+# data carries real ±30-40 ADC-unit zigzag at the per-sample timescale (visible
+# as wobble on rising edges). The Windows vendor app clearly low-pass filters
+# its display, so we do the same: a tiny Gaussian smooth knocks down the
+# alternating-sample noise, then a Catmull-Rom cubic spline upsample removes
+# the polyline-corner artifacts. Total drawn points stay well under 1000 with
+# no measurable perf hit on pyqtgraph.
+_INTERP_THRESHOLD = 600      # apply smoothing+interpolation only when display_samples < this
+                             # (covers fast-fixed time-bases up to ~20us/div = 480 samples)
+_INTERP_FACTOR = 10          # output 10 points per input segment
+# 5-tap Gaussian (sigma≈1.0); sums to 1.0
+_SMOOTH_KERNEL = np.array([0.06136, 0.24477, 0.38774, 0.24477, 0.06136])
+
+
+def _smooth_and_upsample(y: np.ndarray, factor: int = _INTERP_FACTOR) -> np.ndarray:
+    """Low-pass smooth then Catmull-Rom upsample, numpy-only.
+
+    Returns ``(len(y) - 1) * factor + 1`` points spanning the same X range as
+    the input. Endpoints are reflected to keep the smoothing kernel from
+    pulling the curve toward zero at the boundaries.
+    """
+    n = len(y)
+    if n < 2 or factor <= 1:
+        return y.astype(float, copy=False)
+    yf = y.astype(float, copy=False)
+    if n >= len(_SMOOTH_KERNEL):
+        # Reflect-pad to preserve endpoint values during convolution
+        pad = len(_SMOOTH_KERNEL) // 2
+        padded = np.concatenate((yf[pad:0:-1], yf, yf[-2:-pad - 2:-1]))
+        yf = np.convolve(padded, _SMOOTH_KERNEL, mode="valid")
+    p = np.concatenate(([yf[0]], yf, [yf[-1]]))  # length n+2 for tangents
+    t = np.linspace(0.0, 1.0, factor, endpoint=False)
+    h00 = 2 * t**3 - 3 * t**2 + 1
+    h10 = t**3 - 2 * t**2 + t
+    h01 = -2 * t**3 + 3 * t**2
+    h11 = t**3 - t**2
+    out = np.empty((n - 1) * factor + 1, dtype=float)
+    for i in range(n - 1):
+        m1 = (p[i + 2] - p[i]) * 0.5
+        m2 = (p[i + 3] - p[i + 1]) * 0.5
+        out[i * factor:(i + 1) * factor] = (
+            h00 * p[i + 1] + h10 * m1 + h01 * p[i + 2] + h11 * m2
+        )
+    out[-1] = yf[-1]
+    return out
+
+
 # Maps user-facing display V/div to the 3 hardware gain settings
 _HW_VSCALE_BREAKPOINTS = [(0.05, 0.02), (0.5, 0.125)]
 
@@ -220,7 +268,13 @@ class ScopeWindow(QMainWindow):
         for ch_id, samples in self._last_frame_np.items():
             if ch_id not in self._channel_data:
                 continue
-            self._channel_data[ch_id]["curve"].setData(samples[start:end])
+            window = samples[start:end]
+            if len(window) < _INTERP_THRESHOLD and len(window) >= 2:
+                y = _smooth_and_upsample(window)
+                x = np.linspace(0, len(window) - 1, len(y))
+                self._channel_data[ch_id]["curve"].setData(x, y)
+            else:
+                self._channel_data[ch_id]["curve"].setData(window)
 
     def _volts_to_adc(self, volts, display_vscale, channel_id):
         hw_vscale = _hw_vscale_for(display_vscale)
