@@ -495,25 +495,34 @@ class Hantek1008Raw:
     _FAST_FIXED_NS_PER_DIV_MAX = 100_000  # 100µs..1ns are fast-fixed (200µs is slow-burst)
 
     # Slow-burst sample-rate B_SUM by ns_per_div. The 0xac payload's two 24-bit B
-    # fields always sum to a constant per a3 ID — that constant encodes the ADC
-    # sample period. Empirically (matching the rate observed at 500µs with our
-    # A=4032 default) the relationship is B_SUM ≈ ns_per_div / 100, which keeps
-    # the captured 4000 samples spanning exactly 10×ns_per_div of real time:
+    # fields always sum to a constant per a3 ID — Windows's pcap shows a unique
+    # B_SUM value at each time-base. Empirically (matching the rate observed at
+    # 500µs with our A=4032 default) the relationship is B_SUM ≈ ns_per_div / 100:
     #   500µs  -> 5000   (vendor sends 5002, ±2 firmware-internal tolerance)
     #   1ms    -> 10000
     #   2ms    -> 20000
     #   5ms    -> 50000
     #   10ms   -> 100000  (vendor: 100494)
     #   20ms   -> 200000  (vendor: 200293)
-    # 200µs is special: Windows always sends B_SUM=1402 (NOT the formula's 2000).
-    # The device's slow-burst sample rate is fixed at ~1250ns/sample regardless
-    # of B_SUM, so the 4000-short buffer always spans 5000µs (the 500µs window).
-    # At 200µs the GUI displays only the centered 1600 samples (= 2000µs) of
-    # this buffer — hence A is forced to 4000 here so the trigger event always
-    # lands at buffer center, allowing the GUI to slide the displayed 1600-
-    # sample window in software (matching how fast-fixed handles trigger-marker
-    # movement). Windows itself varies A at 200µs, but with our software-slide
-    # display it's simpler and equally functional to fix A=4000.
+    #
+    # IMPORTANT — slow-burst rate floor: contrary to what B_SUM's apparent role
+    # as a "sample period" suggests, the device's slow-burst ADC clock is bounded
+    # below at ~1250 ns/sample. Live testing at 200µs/div with B_SUM=1402 (which
+    # would imply ~350 ns/sample if the formula held) showed the device still
+    # samples at 1250ns — the captured 4000-short buffer covers 5000µs (= the
+    # 500µs/div window), not 1400µs. So at 200µs/div we send the device-required
+    # B_SUM=1402 (Windows uses this exact value; mismatched values may cause the
+    # device to refuse the time-base) but treat the result as a 5000µs capture
+    # at the slow-burst floor rate. The GUI compensates by displaying only the
+    # centered 1600 samples (2000µs) — see SLOW_BURST_NS_PER_SAMPLE in
+    # gui/scope_window.py and the software-slide logic in _redraw().
+    #
+    # 200µs A override: A is forced to 4000 (full buffer, centered trigger split
+    # B1=B2=701) so the trigger event always lands at buffer index 2000. The
+    # GUI's _redraw() slides its 1600-sample display window across the buffer
+    # to follow the user's H-trigger marker — same mechanism as fast-fixed mode.
+    # Windows varies A at 200µs (we've observed 64, 1440), but with our
+    # software-slide display, fixing A=4000 is simpler and equally functional.
     _SLOW_BURST_B_SUM_OVERRIDES = {200_000: 1402}
     _SLOW_BURST_A_OVERRIDES = {200_000: 4000}
 
