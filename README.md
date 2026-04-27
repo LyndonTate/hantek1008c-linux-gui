@@ -3,8 +3,12 @@
 An open-source oscilloscope GUI for the **Hantek 1008C** USB scope on Linux.
 
 The Hantek 1008C is an 8-channel, 12-bit USB oscilloscope. The vendor software is
-Windows-only. This project gives you a fully-featured scope UI on Linux with no
-proprietary software required.
+Windows-only. This project gives you a scope UI on Linux with no proprietary
+software required.
+
+## Demo
+
+https://github.com/user-attachments/assets/15a113a6-694e-49ce-842e-19c3c2059689
 
 ## Features
 
