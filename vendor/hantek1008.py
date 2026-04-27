@@ -118,6 +118,12 @@ class Hantek1008Raw:
         self.__pending_trigger_level: Optional[int] = None
         self.__trigger_level_lock = Lock()
 
+        self._free_run: bool = False  # skip a55a trigger wait when True
+
+    def set_free_run(self, enabled: bool) -> None:
+        """Skip the hardware trigger wait in burst mode (free-run / untriggered display)."""
+        self._free_run = enabled
+
     def connect(self) -> None:
         """Find a plugged in hantek 1008c device and set up the connection to it"""
 
@@ -464,7 +470,8 @@ class Hantek1008Raw:
 
         self.__send_cmd(0xc0)
 
-        self.__send_a55a_command()
+        if not self._free_run:
+            self.__send_a55a_command()
 
         sample_response = self.__send_c6_a6_command(0x02)
         sample_response += self.__send_c6_a6_command(0x03)

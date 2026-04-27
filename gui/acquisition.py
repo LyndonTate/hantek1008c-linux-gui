@@ -12,7 +12,7 @@ class AcquisitionThread(QThread):
 
     def __init__(self, ns_per_div=500_000, active_channels=None, vscales=None,
                  trigger_channel=0, trigger_slope="rising", trigger_level=2048,
-                 initial_pre_samples=2016, device=None, parent=None):
+                 initial_pre_samples=2016, device=None, free_run=False, parent=None):
         super().__init__(parent)
         self._ns_per_div = ns_per_div
         self._active_channels = active_channels or [0]
@@ -21,6 +21,7 @@ class AcquisitionThread(QThread):
         self._trigger_slope = trigger_slope
         self._trigger_level = trigger_level
         self._initial_pre_samples = initial_pre_samples
+        self._free_run = free_run
         self._running = False
         self._stop_requested = False  # set by stop() to abort before entering the burst loop
         self._device = None
@@ -66,6 +67,8 @@ class AcquisitionThread(QThread):
                 self.error.emit(str(e))
                 return
 
+        device.set_free_run(self._free_run)
+
         self._running = True
         if self._stop_requested:
             self._device = None
@@ -79,6 +82,10 @@ class AcquisitionThread(QThread):
                     continue
                 except Exception as e:
                     raise
+                # Guard against empty frames (can occur in free-run mode if device
+                # returns before a capture is ready)
+                if not data or any(len(v) == 0 for v in data.values()):
+                    continue
                 self.new_frame.emit(data)
         finally:
             # ScopeWindow owns the device lifetime; we never close it here.
@@ -91,6 +98,11 @@ class AcquisitionThread(QThread):
     def queue_trigger_level(self, level: int) -> None:
         if self._device is not None:
             self._device.queue_trigger_level(level)
+
+    def set_free_run(self, enabled: bool) -> None:
+        self._free_run = enabled
+        if self._device is not None:
+            self._device.set_free_run(enabled)
 
     def stop(self):
         self._stop_requested = True

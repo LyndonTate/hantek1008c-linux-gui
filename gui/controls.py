@@ -79,6 +79,7 @@ class ControlsPanel(QWidget):
     channel_toggled = pyqtSignal(int, bool)  # ch_idx, is_on
     vscale_changed = pyqtSignal(int, float)  # ch_idx, vscale
     trigger_channel_changed = pyqtSignal(int)  # ch_idx
+    trigger_enabled_changed = pyqtSignal(bool)  # is_enabled
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,6 +89,7 @@ class ControlsPanel(QWidget):
         self._active = {i: (i == 0) for i in range(8)}
         self._vscales = {i: 1.0 for i in range(8)}
         self._trigger_ch = 0
+        self._trigger_enabled = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 8)
@@ -192,23 +194,44 @@ class ControlsPanel(QWidget):
             first_active = next(i for i in range(8) if self._active[i])
             self._set_trigger_channel(first_active)
         else:
-            self._trig_btns[ch_idx].setStyleSheet(
-                _trig_btn_style(color, ch_idx == self._trigger_ch, new_state))
+            self._update_trig_btn_styles()
         self.channel_toggled.emit(ch_idx, new_state)
 
     def _on_trigger(self, ch_idx):
-        if not self._active[ch_idx] or ch_idx == self._trigger_ch:
+        if not self._active[ch_idx]:
+            return
+        if ch_idx == self._trigger_ch and self._trigger_enabled:
+            # clicking the active trigger button → disable trigger (free-run)
+            self._trigger_enabled = False
+            self._update_trig_btn_styles()
+            self.trigger_enabled_changed.emit(False)
+            return
+        if not self._trigger_enabled:
+            # any T click while disabled → re-enable on that channel
+            prev_ch = self._trigger_ch
+            self._trigger_enabled = True
+            self._set_trigger_channel(ch_idx)
+            self.trigger_enabled_changed.emit(True)
+            if ch_idx != prev_ch:
+                self.trigger_channel_changed.emit(ch_idx)
             return
         self._set_trigger_channel(ch_idx)
         self.trigger_channel_changed.emit(ch_idx)
 
     def _set_trigger_channel(self, ch_idx):
         self._trigger_ch = ch_idx
+        self._update_trig_btn_styles()
+
+    def _update_trig_btn_styles(self):
         for i, btn in enumerate(self._trig_btns):
-            btn.setStyleSheet(_trig_btn_style(CHANNEL_COLORS[i], i == ch_idx, self._active[i]))
+            is_selected = (i == self._trigger_ch) and self._trigger_enabled
+            btn.setStyleSheet(_trig_btn_style(CHANNEL_COLORS[i], is_selected, self._active[i]))
 
     def get_trigger_channel(self):
         return self._trigger_ch
+
+    def is_trigger_enabled(self):
+        return self._trigger_enabled
 
     def get_ns_per_div(self):
         return self._time_combo.currentData()

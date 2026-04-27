@@ -176,6 +176,7 @@ class ScopeWindow(QMainWindow):
         self._controls.channel_toggled.connect(self._on_channel_toggled)
         self._controls.vscale_changed.connect(self._on_vscale_changed)
         self._controls.trigger_channel_changed.connect(self._on_trigger_channel_changed)
+        self._controls.trigger_enabled_changed.connect(self._on_trigger_enabled_changed)
 
     def _setup_plot(self):
         self._plot_widget.setBackground("#000000")
@@ -250,7 +251,10 @@ class ScopeWindow(QMainWindow):
 
     def _redraw(self):
         ns = self._controls.get_ns_per_div()
-        if self._frame_size > self._display_samples:
+        if not self._controls.is_trigger_enabled():
+            # Free-run: no trigger event to align to, just show the start of the buffer.
+            start, end = 0, self._display_samples
+        elif self._frame_size > self._display_samples:
             # The captured buffer is larger than the labeled time window — true
             # in fast-fixed mode at low ns/div AND in slow-burst at 200µs (where
             # the 4000-sample buffer's 5000µs span exceeds the 2000µs label).
@@ -441,6 +445,7 @@ class ScopeWindow(QMainWindow):
             trigger_level=trig_adc,
             initial_pre_samples=initial_pre,
             device=self._device,
+            free_run=not self._controls.is_trigger_enabled(),
         )
         self._acq.new_frame.connect(self.on_new_frame)
         self._acq.device_ready.connect(self._on_device_ready)
@@ -504,6 +509,12 @@ class ScopeWindow(QMainWindow):
     def _on_trigger_channel_changed(self, ch_idx):
         self._update_trigger_marker_label()
         self._restart_acquisition()
+
+    def _on_trigger_enabled_changed(self, enabled):
+        self._trigger_marker.setVisible(enabled)
+        self._h_trigger_marker.setVisible(enabled)
+        if self._acq is not None:
+            self._acq.set_free_run(not enabled)
 
     def _on_vscale_changed(self, ch_idx, vscale):
         self._update_yrange()
