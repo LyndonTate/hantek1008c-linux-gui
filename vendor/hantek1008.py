@@ -200,20 +200,30 @@ class Hantek1008Raw:
         response = self.__send_cmd(0xc6, parameter=[parameter], response_length=2, echo_expected=False)
         sample_length = int.from_bytes(response, byteorder="big", signed=False)
         sample_packages_count = int(math.ceil(sample_length / self.__MAX_PACKAGE_SIZE))
+        log.debug("c6%02x sample_length=%d packages=%d (ns/div=%d active_ch=%s)",
+                 parameter, sample_length, sample_packages_count,
+                 self.__ns_per_div, self.__active_channels)
         samples = b''
         for _ in range(sample_packages_count):
             response = self.__send_cmd(0xa6, parameter=[parameter], response_length=64, echo_expected=False)
             samples += response
+        log.debug("c6%02x got %d bytes (trimmed from %d)", parameter, sample_length, len(samples))
         return samples[0:sample_length]
 
     def __send_a55a_command(self, attempts: int=20) -> None:
-        for _ in range(attempts):
+        responses = []
+        for i in range(attempts):
             response = self.__send_cmd(0xa5, parameter=[0x5a], response_length=1)
             assert response[0] in [0, 1, 2, 3]
+            responses.append(response[0])
             if response[0] in [2, 3]:
+                log.debug("a55a fired after %d polls, responses=%s (ns/div=%d)",
+                         i + 1, responses, self.__ns_per_div)
                 return
             sleep(0.02)
             self.__send_ping()
+        log.warning("a55a never fired, responses=%s (ns/div=%d)",
+                    responses, self.__ns_per_div)
         raise RuntimeError(f"a55a command failed, all {attempts} attempts were answered with 0 or 1.")
 
     def __send_set_time_div(self, ns_per_div: int = 500000) -> None:
@@ -228,6 +238,7 @@ class Hantek1008Raw:
         assert ns_per_div in self.__burst_mode_ns_per_div_to_id_dic, "The given ns_per_div is invalid"
 
         time_per_div_id = self.__burst_mode_ns_per_div_to_id_dic[ns_per_div]
+        log.info("a3 set_time_div ns/div=%d -> id=0x%02x", ns_per_div, time_per_div_id)
         self.__send_cmd(0xa3, parameter=[time_per_div_id])
 
     @staticmethod
@@ -332,7 +343,7 @@ class Hantek1008Raw:
         # activate all 8 channels
         self.__send_set_active_channels(Hantek1008Raw.valid_channel_ids())
 
-        self.__send_set_time_div(500 * 1000)  # 500us, the default value in the windows software
+        self.__send_set_time_div(self.__ns_per_div)  # use configured value, not hardcoded 500us
 
         self.__send_set_trigger(0, "rising")
 
@@ -418,6 +429,16 @@ class Hantek1008Raw:
 
     def request_samples_burst_mode(self) -> Dict[int, List[int]]:
         """get the data"""
+        log.debug("burst-cycle start (ns/div=%d active_ch=%s)",
+                  self.__ns_per_div, self.__active_channels)
+
+        # Pre-cycle warm-up — Windows sends e4/e6/f3 at the start of every burst
+        # cycle, before applying pending changes or arming the trigger. Without
+        # this, fast-fixed mode (ns_per_div <= 100us) never fires the trigger
+        # (a55a polls return 0 forever) — the device tolerates the missing
+        # warm-up at slower time-bases but not at the higher sample rates.
+        self.__send_cmd(0xe4, parameter=[0x01])
+        self.__send_cmd(0xe6, parameter=[0x01], echo_expected=False, response_length=10)
         self.__send_ping()
 
         # apply any pending changes before starting this capture cycle
@@ -434,7 +455,7 @@ class Hantek1008Raw:
             self.__trigger_level = pending_level
             self.__send_set_trigger_level(pending_level)
 
-        # these two commands are not necessarily required
+        # second e4/e6 pair — also part of Windows' per-cycle prologue
         self.__send_cmd(0xe4, parameter=[0x01])
         self.__send_cmd(0xe6, parameter=[0x01], echo_expected=False, response_length=10)
         # response ~ e906e506e406e406e506
@@ -456,7 +477,63 @@ class Hantek1008Raw:
         sample_shorts = Hantek1008Raw.__from_bytes_to_shorts(sample_response)
 
         per_channel_data = Hantek1008Raw.__to_per_channel_lists(sample_shorts, self.__active_channels)
+        log.debug("burst frame: total_shorts=%d per_ch=%s",
+                 len(sample_shorts),
+                 {ch: len(v) for ch, v in per_channel_data.items()})
         return per_channel_data
+
+    # In fast-fixed mode (a3 IDs 0x00..0x0F, i.e. ns_per_div <= 100_000) the Windows
+    # vendor app always sends an 0xac payload of the form [A][B][B], where A is the
+    # total per-channel sample count. The pcap was captured with 1 active channel so
+    # A = 0x0fa0 = 4000 (= full hardware buffer of 4000 shorts). With N>1 active
+    # channels the buffer is split, so A must scale to 4000/N or the trigger never
+    # arms (a55a polls return 0 forever). The B fields appear to control the
+    # hardware sample-rate divider in this mode and stay constant at 0x000342 (834)
+    # each — using slow-burst's B_SUM=5002 here causes the device to sample at the
+    # wrong rate (cycles appear scaled by ~5002/1668 ≈ 3x).
+    _FAST_FIXED_B = 0x000342  # 834 — sample-rate divider word (constant in Windows pcap)
+    _FAST_FIXED_NS_PER_DIV_MAX = 100_000  # 100µs..1ns are fast-fixed (200µs is slow-burst)
+
+    # Slow-burst sample-rate B_SUM by ns_per_div. The 0xac payload's two 24-bit B
+    # fields always sum to a constant per a3 ID — Windows's pcap shows a unique
+    # B_SUM value at each time-base. Empirically (matching the rate observed at
+    # 500µs with our A=4032 default) the relationship is B_SUM ≈ ns_per_div / 100:
+    #   500µs  -> 5000   (vendor sends 5002, ±2 firmware-internal tolerance)
+    #   1ms    -> 10000
+    #   2ms    -> 20000
+    #   5ms    -> 50000
+    #   10ms   -> 100000  (vendor: 100494)
+    #   20ms   -> 200000  (vendor: 200293)
+    #
+    # IMPORTANT — slow-burst rate floor: contrary to what B_SUM's apparent role
+    # as a "sample period" suggests, the device's slow-burst ADC clock is bounded
+    # below at ~1250 ns/sample. Live testing at 200µs/div with B_SUM=1402 (which
+    # would imply ~350 ns/sample if the formula held) showed the device still
+    # samples at 1250ns — the captured 4000-short buffer covers 5000µs (= the
+    # 500µs/div window), not 1400µs. So at 200µs/div we send the device-required
+    # B_SUM=1402 (Windows uses this exact value; mismatched values may cause the
+    # device to refuse the time-base) but treat the result as a 5000µs capture
+    # at the slow-burst floor rate. The GUI compensates by displaying only the
+    # centered 1600 samples (2000µs) — see SLOW_BURST_NS_PER_SAMPLE in
+    # gui/scope_window.py and the software-slide logic in _redraw().
+    #
+    # 200µs A override: A is forced to 4000 (full buffer, centered trigger split
+    # B1=B2=701) so the trigger event always lands at buffer index 2000. The
+    # GUI's _redraw() slides its 1600-sample display window across the buffer
+    # to follow the user's H-trigger marker — same mechanism as fast-fixed mode.
+    # Windows varies A at 200µs (we've observed 64, 1440), but with our
+    # software-slide display, fixing A=4000 is simpler and equally functional.
+    _SLOW_BURST_B_SUM_OVERRIDES = {200_000: 1402}
+    _SLOW_BURST_A_OVERRIDES = {200_000: 4000}
+
+    @staticmethod
+    def _slow_burst_b_sum(ns_per_div: int) -> int:
+        if ns_per_div in Hantek1008Raw._SLOW_BURST_B_SUM_OVERRIDES:
+            return Hantek1008Raw._SLOW_BURST_B_SUM_OVERRIDES[ns_per_div]
+        return max(2, ns_per_div // 100)
+
+    def _is_fast_fixed_mode(self) -> bool:
+        return self.__ns_per_div <= Hantek1008Raw._FAST_FIXED_NS_PER_DIV_MAX
 
     def _hw_trigger_ac_payload(self, pre_samples: int) -> bytes:
         """Build the 8-byte 0xac payload for the given pre-trigger sample count.
@@ -473,18 +550,47 @@ class Hantek1008Raw:
         c602 returns N×A bytes interleaved across N channels, so actual pre-trigger
         samples per channel = c602_bytes/2/N = A/2.  Therefore A = 2×pre_samples
         places the trigger event exactly at sample index pre_samples in the output.
+
+        In fast-fixed mode (ns_per_div <= 100us, a3 IDs 0x00..0x0F) the device
+        ignores per-burst pre-trigger requests and the Windows app always sends a
+        constant payload — emulating that here is required for the device to
+        sample at the correct rate.
         """
+        if self._is_fast_fixed_mode():
+            n_ch = max(1, len(self.__active_channels))
+            A = 4000 // n_ch
+            B = Hantek1008Raw._FAST_FIXED_B
+            payload = A.to_bytes(2, 'big') + B.to_bytes(3, 'big') + B.to_bytes(3, 'big')
+            log.info("AC[fast-fixed] ns/div=%d n_ch=%d A=%d B=%d -> payload=%s",
+                     self.__ns_per_div, n_ch, A, B, payload.hex())
+            return payload
         n_ch = max(1, len(self.__active_channels))
         max_pre = 4000 // n_ch          # samples per channel the hardware can buffer
         capped = min(pre_samples, max_pre)
-        A = max(400, min(7520, 2 * capped))
-        B_SUM = 5002
-        if A <= 4000:
-            B1 = math.ceil(A * 2501 / 4000)
+        B_SUM = Hantek1008Raw._slow_burst_b_sum(self.__ns_per_div)
+        if self.__ns_per_div in Hantek1008Raw._SLOW_BURST_A_OVERRIDES:
+            # Device-required fixed buffer size for this time-base. Trigger
+            # position is encoded purely in B1/B2 split (max_pre = 4000 maps to
+            # full B_SUM range, centered = B_SUM/2).
+            A = Hantek1008Raw._SLOW_BURST_A_OVERRIDES[self.__ns_per_div]
+            pre_frac = capped / max_pre  # 0.0..1.0, 0.5 = centered trigger
+            B1 = int(round(pre_frac * B_SUM))
         else:
-            B1 = A * 2501 // 4000
+            A = max(400, min(7520, 2 * capped))
+            # B1 places the trigger event proportionally inside the captured window;
+            # at A=4000 the split is centered (B1 = B_SUM/2). The 4000 reference is the
+            # full hardware buffer, not B_SUM, so the same fraction works for any rate.
+            half = B_SUM // 2
+            if A <= 4000:
+                B1 = math.ceil(A * half / 4000)
+            else:
+                B1 = A * half // 4000
+        B1 = max(0, min(B_SUM, B1))
         B2 = B_SUM - B1
-        return A.to_bytes(2, 'big') + B1.to_bytes(3, 'big') + B2.to_bytes(3, 'big')
+        payload = A.to_bytes(2, 'big') + B1.to_bytes(3, 'big') + B2.to_bytes(3, 'big')
+        log.info("AC[slow-burst] ns/div=%d pre_req=%d n_ch=%d A=%d B1=%d B2=%d -> payload=%s",
+                 self.__ns_per_div, pre_samples, n_ch, A, B1, B2, payload.hex())
+        return payload
 
     def queue_hw_trigger_pre_samples(self, pre_samples: int) -> None:
         """Thread-safe: schedule a hardware pre-trigger buffer depth change.
@@ -509,9 +615,12 @@ class Hantek1008Raw:
         """Reconfigure the device without a full reinit (no USB reset, no 0xb0).
 
         Safe to call while the device is idle (between burst cycles or after the
-        acquisition thread has been stopped).  Matches the minimal sequence the
-        vendor software uses when toggling channels: a0, aa, a2, ac, f3 (ping).
+        acquisition thread has been stopped).  Sends: a0, aa (channels), a2
+        (vscales), a3 (time div), c1 (trigger), ac (pre-trigger depth), f3 (ping).
         """
+        log.info("reconfigure: ns/div=%d active_ch=%s vscales=%s trig_ch=%d slope=%s level=%d pre=%d",
+                 ns_per_div, active_channels, vscales, trigger_channel,
+                 trigger_slope, trigger_level, pre_samples)
         self.__active_channels = sorted(copy.deepcopy(active_channels))
         self.__vertical_scale_factors = copy.deepcopy(vscales)
         self.__ns_per_div = ns_per_div
@@ -525,10 +634,30 @@ class Hantek1008Raw:
         with self.__trigger_level_lock:
             self.__pending_trigger_level = None
 
+        # Mirror _init3 exactly: preamble, first a3 + commit, channels/vscales, second a3 + trigger.
+        self.__send_cmd(0xf6, sec_till_response_request=0.2132)
+        self.__send_cmd(0xe5, echo_expected=False, response_length=2)
+        self.__send_cmd(0xf7, echo_expected=False, response_length=64)
+        self.__send_cmd(0xf8, echo_expected=False, response_length=64)
+        self.__send_cmd(0xfa, echo_expected=False, response_length=56)
+
+        # First a3 + commit sequence (matches _init3: a3 → small ac → e4 → e6 → f3)
+        self.__send_set_time_div(self.__ns_per_div)
+        self.__send_cmd(0xac, parameter=bytes.fromhex("00c80002bd0002bd"))
+        self.__send_cmd(0xe4, parameter=[0x01])
+        self.__send_cmd(0xe6, parameter=[0x01], echo_expected=False, response_length=10)
+        self.__send_ping()
+
+        # Channel and vscale setup
         self.__send_set_active_channels(self.__active_channels)
         self.__send_set_vertical_scale(self.__vertical_scale_factors)
+
+        # Second a3 + full trigger setup
+        self.__send_set_time_div(self.__ns_per_div)
         self.__send_set_trigger(self.__trigger_channel, self.__trigger_slope)
+        self.__send_cmd(0xa7, parameter=[0x00, 0x00], response_length=1)
         self.__send_cmd(0xac, parameter=self._hw_trigger_ac_payload(pre_samples))
+        self.__send_set_trigger_level(self.__trigger_level)
         self.__send_ping()
 
     @staticmethod
