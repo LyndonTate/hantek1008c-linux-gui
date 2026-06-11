@@ -74,12 +74,20 @@ def _trig_btn_style(color, is_selected, ch_is_active):
             "padding: 2px 3px; font-size: 11px;")
 
 
+def _mode_btn_style(is_selected):
+    if is_selected:
+        return ("background-color: #ff9900; color: #000000; border: none; "
+                "padding: 3px 6px; font-size: 11px; font-weight: bold;")
+    return ("background-color: #2a2a2a; color: #888888; border: 1px solid #444444; "
+            "padding: 3px 6px; font-size: 11px;")
+
+
 class ControlsPanel(QWidget):
     time_div_changed = pyqtSignal(int)       # ns_per_div
     channel_toggled = pyqtSignal(int, bool)  # ch_idx, is_on
     vscale_changed = pyqtSignal(int, float)  # ch_idx, vscale
     trigger_channel_changed = pyqtSignal(int)  # ch_idx
-    trigger_enabled_changed = pyqtSignal(bool)  # is_enabled
+    acq_mode_changed = pyqtSignal(str)       # "auto" | "normal"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,8 +97,9 @@ class ControlsPanel(QWidget):
         self._active = {i: (i == 0) for i in range(8)}
         self._vscales = {i: 1.0 for i in range(8)}
         self._trigger_ch = 0
-        # Start the app in free-run by default so the display shows immediately, instead of waiting for a hardware trigger event.
-        self._trigger_enabled = False
+        # "auto" force-fires after a timeout (free-running scroll when no edge
+        # matches); "normal" holds the display until a matching edge arrives.
+        self._acq_mode = "auto"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 8)
@@ -116,6 +125,30 @@ class ControlsPanel(QWidget):
         sep.setFixedHeight(1)
         sep.setStyleSheet("background-color: #333333; margin-top: 4px; margin-bottom: 2px;")
         layout.addWidget(sep)
+
+        lbl_trig = QLabel("Trigger Mode")
+        lbl_trig.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(lbl_trig)
+
+        mode_row = QWidget()
+        mode_row.setStyleSheet("background-color: transparent;")
+        mode_layout = QHBoxLayout(mode_row)
+        mode_layout.setContentsMargins(0, 0, 0, 0)
+        mode_layout.setSpacing(4)
+        self._auto_btn = QPushButton("Auto")
+        self._auto_btn.setToolTip("Free-run / scroll when no trigger edge matches")
+        self._normal_btn = QPushButton("Normal")
+        self._normal_btn.setToolTip("Hold the display until a trigger edge matches")
+        for btn, mode in ((self._auto_btn, "auto"), (self._normal_btn, "normal")):
+            btn.clicked.connect(lambda _, m=mode: self._on_acq_mode(m))
+            mode_layout.addWidget(btn)
+        layout.addWidget(mode_row)
+        self._update_mode_btn_styles()
+
+        sep2 = QLabel()
+        sep2.setFixedHeight(1)
+        sep2.setStyleSheet("background-color: #333333; margin-top: 4px; margin-bottom: 2px;")
+        layout.addWidget(sep2)
 
         lbl2 = QLabel("Channels")
         lbl2.setStyleSheet("color: #888888; font-size: 11px;")
@@ -202,23 +235,21 @@ class ControlsPanel(QWidget):
     def _on_trigger(self, ch_idx):
         if not self._active[ch_idx]:
             return
-        if ch_idx == self._trigger_ch and self._trigger_enabled:
-            # clicking the active trigger button → disable trigger (free-run)
-            self._trigger_enabled = False
-            self._update_trig_btn_styles()
-            self.trigger_enabled_changed.emit(False)
-            return
-        if not self._trigger_enabled:
-            # any T click while disabled → re-enable on that channel
-            prev_ch = self._trigger_ch
-            self._trigger_enabled = True
-            self._set_trigger_channel(ch_idx)
-            self.trigger_enabled_changed.emit(True)
-            if ch_idx != prev_ch:
-                self.trigger_channel_changed.emit(ch_idx)
+        if ch_idx == self._trigger_ch:
             return
         self._set_trigger_channel(ch_idx)
         self.trigger_channel_changed.emit(ch_idx)
+
+    def _on_acq_mode(self, mode):
+        if mode == self._acq_mode:
+            return
+        self._acq_mode = mode
+        self._update_mode_btn_styles()
+        self.acq_mode_changed.emit(mode)
+
+    def _update_mode_btn_styles(self):
+        self._auto_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "auto"))
+        self._normal_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "normal"))
 
     def _set_trigger_channel(self, ch_idx):
         self._trigger_ch = ch_idx
@@ -226,14 +257,17 @@ class ControlsPanel(QWidget):
 
     def _update_trig_btn_styles(self):
         for i, btn in enumerate(self._trig_btns):
-            is_selected = (i == self._trigger_ch) and self._trigger_enabled
+            is_selected = (i == self._trigger_ch)
             btn.setStyleSheet(_trig_btn_style(CHANNEL_COLORS[i], is_selected, self._active[i]))
 
     def get_trigger_channel(self):
         return self._trigger_ch
 
-    def is_trigger_enabled(self):
-        return self._trigger_enabled
+    def get_acq_mode(self):
+        return self._acq_mode
+
+    def is_free_run(self):
+        return self._acq_mode == "auto"
 
     def get_ns_per_div(self):
         return self._time_combo.currentData()

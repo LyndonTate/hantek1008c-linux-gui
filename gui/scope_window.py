@@ -207,11 +207,11 @@ class ScopeWindow(QMainWindow):
         self._controls.channel_toggled.connect(self._on_channel_toggled)
         self._controls.vscale_changed.connect(self._on_vscale_changed)
         self._controls.trigger_channel_changed.connect(self._on_trigger_channel_changed)
-        self._controls.trigger_enabled_changed.connect(self._on_trigger_enabled_changed)
+        self._controls.acq_mode_changed.connect(self._on_acq_mode_changed)
 
-        # Align trigger marker visibility and internal state to the controls' initial setting
-        # so the UI doesn't start waiting for a trigger so user gets immediate display of readings.
-        self._on_trigger_enabled_changed(self._controls.is_trigger_enabled())
+        # The trigger markers are always active — the hardware trigger is always
+        # armed. In auto mode the device free-runs when no edge matches.
+        self._on_acq_mode_changed(self._controls.get_acq_mode())
 
     def _setup_plot(self):
         self._plot_widget.setBackground("#000000")
@@ -299,8 +299,9 @@ class ScopeWindow(QMainWindow):
 
     def _redraw(self):
         ns = self._controls.get_ns_per_div()
-        if not self._controls.is_trigger_enabled():
-            # Free-run: no trigger event to align to, just show the start of the buffer.
+        if self._controls.is_free_run():
+            # Auto mode: no triggered alignment, just show the start of the buffer
+            # (force-fired captures slide freely; matched captures stay put).
             start, end = 0, self._display_samples
         elif self._frame_size > self._display_samples:
             # The captured buffer is larger than the labeled time window — true
@@ -494,7 +495,7 @@ class ScopeWindow(QMainWindow):
             trigger_level=trig_adc,
             initial_pre_samples=initial_pre,
             device=self._device,
-            free_run=not self._controls.is_trigger_enabled(),
+            free_run=self._controls.is_free_run(),
         )
         self._acq.new_frame.connect(self.on_new_frame)
         self._acq.device_ready.connect(self._on_device_ready)
@@ -559,11 +560,11 @@ class ScopeWindow(QMainWindow):
         self._update_trigger_marker_label()
         self._restart_acquisition()
 
-    def _on_trigger_enabled_changed(self, enabled):
-        self._trigger_marker.setVisible(enabled)
-        self._h_trigger_marker.setVisible(enabled)
+    def _on_acq_mode_changed(self, mode):
+        self._trigger_marker.setVisible(True)
+        self._h_trigger_marker.setVisible(True)
         if self._acq is not None:
-            self._acq.set_free_run(not enabled)
+            self._acq.set_free_run(self._controls.is_free_run())
 
     def _on_vscale_changed(self, ch_idx, vscale):
         self._update_yrange()
