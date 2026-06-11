@@ -118,10 +118,10 @@ class Hantek1008Raw:
         self.__pending_trigger_level: Optional[int] = None
         self.__trigger_level_lock = Lock()
 
-        self._free_run: bool = False  # skip a55a trigger wait when True
+        self._free_run: bool = False  # free-run / untriggered display (device auto-fires)
 
     def set_free_run(self, enabled: bool) -> None:
-        """Skip the hardware trigger wait in burst mode (free-run / untriggered display)."""
+        """Enable free-run / untriggered display, relying on the device's auto-fire timeout."""
         self._free_run = enabled
 
     def connect(self) -> None:
@@ -470,8 +470,10 @@ class Hantek1008Raw:
 
         self.__send_cmd(0xc0)
 
-        if not self._free_run:
-            self.__send_a55a_command()
+        # Must wait for a502 (buffer frozen) before reading; reading a live
+        # buffer tears the c602/c603 halves. Free-run relies on the device
+        # auto-firing after a timeout, hence the larger poll budget.
+        self.__send_a55a_command(attempts=200 if self._free_run else 20)
 
         sample_response = self.__send_c6_a6_command(0x02)
         sample_response += self.__send_c6_a6_command(0x03)
