@@ -87,6 +87,7 @@ class ControlsPanel(QWidget):
     channel_toggled = pyqtSignal(int, bool)  # ch_idx, is_on
     vscale_changed = pyqtSignal(int, float)  # ch_idx, vscale
     trigger_channel_changed = pyqtSignal(int)  # ch_idx
+    trigger_slope_changed = pyqtSignal(str)  # "rising" | "falling"
     acq_mode_changed = pyqtSignal(str)       # "auto" | "normal" | "single"
     cursor_toggled = pyqtSignal(bool)        # measurement cursor on/off
 
@@ -98,6 +99,7 @@ class ControlsPanel(QWidget):
         self._active = {i: (i == 0) for i in range(8)}
         self._vscales = {i: 1.0 for i in range(8)}
         self._trigger_ch = 0
+        self._trigger_slope = "rising"
         # "auto" force-fires after a timeout (free-running scroll when no edge
         # matches); "normal" holds the display until a matching edge arrives.
         self._acq_mode = "auto"
@@ -149,6 +151,25 @@ class ControlsPanel(QWidget):
             mode_layout.addWidget(btn)
         layout.addWidget(mode_row)
         self._update_mode_btn_styles()
+
+        lbl_edge = QLabel("Trigger Edge")
+        lbl_edge.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(lbl_edge)
+
+        edge_row = QWidget()
+        edge_row.setStyleSheet("background-color: transparent;")
+        edge_layout = QHBoxLayout(edge_row)
+        edge_layout.setContentsMargins(0, 0, 0, 0)
+        edge_layout.setSpacing(4)
+        self._rising_btn = QPushButton("Rising ⤴")
+        self._rising_btn.setToolTip("Trigger on the rising / leading edge of the waveform")
+        self._falling_btn = QPushButton("Falling ⤵")
+        self._falling_btn.setToolTip("Trigger on the falling / trailing edge of the waveform")
+        for btn, slope in ((self._rising_btn, "rising"), (self._falling_btn, "falling")):
+            btn.clicked.connect(lambda _, s=slope: self._on_trigger_slope(s))
+            edge_layout.addWidget(btn)
+        layout.addWidget(edge_row)
+        self._update_slope_btn_styles()
 
         sep_cur = QLabel()
         sep_cur.setFixedHeight(1)
@@ -260,6 +281,13 @@ class ControlsPanel(QWidget):
         self._set_trigger_channel(ch_idx)
         self.trigger_channel_changed.emit(ch_idx)
 
+    def _on_trigger_slope(self, slope):
+        if slope == self._trigger_slope:
+            return
+        self._trigger_slope = slope
+        self._update_slope_btn_styles()
+        self.trigger_slope_changed.emit(slope)
+
     def _on_acq_mode(self, mode):
         if mode == self._acq_mode:
             return
@@ -288,6 +316,10 @@ class ControlsPanel(QWidget):
         self._normal_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "normal"))
         self._single_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "single"))
 
+    def _update_slope_btn_styles(self):
+        self._rising_btn.setStyleSheet(_mode_btn_style(self._trigger_slope == "rising"))
+        self._falling_btn.setStyleSheet(_mode_btn_style(self._trigger_slope == "falling"))
+
     def _set_trigger_channel(self, ch_idx):
         self._trigger_ch = ch_idx
         self._update_trig_btn_styles()
@@ -299,6 +331,9 @@ class ControlsPanel(QWidget):
 
     def get_trigger_channel(self):
         return self._trigger_ch
+
+    def get_trigger_slope(self):
+        return self._trigger_slope
 
     def get_acq_mode(self):
         return self._acq_mode

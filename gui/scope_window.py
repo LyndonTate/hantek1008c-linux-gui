@@ -212,6 +212,7 @@ class ScopeWindow(QMainWindow):
         self._controls.channel_toggled.connect(self._on_channel_toggled)
         self._controls.vscale_changed.connect(self._on_vscale_changed)
         self._controls.trigger_channel_changed.connect(self._on_trigger_channel_changed)
+        self._controls.trigger_slope_changed.connect(self._on_trigger_slope_changed)
         self._controls.acq_mode_changed.connect(self._on_acq_mode_changed)
         self._controls.cursor_toggled.connect(self._on_cursor_toggled)
 
@@ -499,7 +500,7 @@ class ScopeWindow(QMainWindow):
             active_channels=hw_active,
             vscales=vscales_hw,
             trigger_channel=trig_ch,
-            trigger_slope="rising",
+            trigger_slope=self._controls.get_trigger_slope(),
             trigger_level=trig_adc,
             initial_pre_samples=initial_pre,
             device=self._device,
@@ -576,6 +577,9 @@ class ScopeWindow(QMainWindow):
 
     def _on_trigger_channel_changed(self, ch_idx):
         self._update_trigger_marker_label()
+        self._restart_acquisition()
+
+    def _on_trigger_slope_changed(self, slope):
         self._restart_acquisition()
 
     def _on_acq_mode_changed(self, mode):

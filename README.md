@@ -15,7 +15,9 @@ https://github.com/user-attachments/assets/15a113a6-694e-49ce-842e-19c3c2059689
 - Up to 8 simultaneous channels, toggled on/off individually
 - Adjustable V/div per channel (10 mV – 5 V)
 - Adjustable time/div
-- Hardware trigger with selectable channel, level, and horizontal position
+- Hardware trigger with selectable channel, rising/falling edge, level, and horizontal position
+- Auto / Normal / Single trigger modes
+- Measurement cursor for on-screen Δt, frequency, and ΔV readouts
 - Draggable channel offset handles in a left margin strip
 - Channels stagger vertically on first enable so they don't stack on zero
 
@@ -51,12 +53,9 @@ python3 main.py
 
 ## Known limitations
 
-- Rising edge trigger only (falling edge not yet implemented)
 - No roll mode (continuous scrolling for slow signals)
 - No automatic measurements (Vpp, frequency, RMS, etc.)
-- No measurement cursors
 - No waveform export (CSV, image, etc.)
-- Trigger mode is normal only (no auto-trigger or single-shot)
 
 ## Project structure
 
