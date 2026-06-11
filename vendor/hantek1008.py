@@ -119,7 +119,7 @@ class Hantek1008Raw:
         self.__trigger_level_lock = Lock()
 
         self._free_run: bool = False  # free-run / untriggered display (device auto-fires)
-        self._single_mode: bool = False  # single-shot: free-run preview but report the real trigger
+        self._single_mode: bool = False  # single-shot: wait for one real trigger, then freeze
         self.last_capture_triggered: bool = False  # True if the last burst was a natural trigger
 
     def set_free_run(self, enabled: bool) -> None:
@@ -127,7 +127,7 @@ class Hantek1008Raw:
         self._free_run = enabled
 
     def set_single_mode(self, enabled: bool) -> None:
-        """Single-shot capture: free-run preview that still reports when a real trigger fires."""
+        """Single-shot capture: wait for one genuine trigger edge, then freeze on it."""
         self._single_mode = enabled
 
     def connect(self) -> None:
@@ -519,9 +519,16 @@ class Hantek1008Raw:
         # buffer tears the c602/c603 halves. Free-run forces the capture with
         # c2 after a few polls so the frame slides freely with no trigger.
         if self._single_mode:
-            attempts, force_after = self.__trigger_poll_budget()
-            self.last_capture_triggered = self.__send_a55a_command(
-                attempts=attempts, force_after=force_after, catch_natural=True)
+            # Single-shot: wait for a *genuine* trigger and never force-fire.
+            # Using force_after here created a race — once the c2 force was sent
+            # the device could no longer distinguish a natural freeze from the
+            # forced one, so any edge landing at/after force_after was reported
+            # untriggered and the GUI failed to freeze. Polling like Normal (no
+            # force, RuntimeError -> retry in the acquisition loop) makes the
+            # capture report True on the first real edge every time, so the GUI
+            # freezes reliably.
+            attempts, _ = self.__trigger_poll_budget()
+            self.last_capture_triggered = self.__send_a55a_command(attempts=attempts)
         elif self._free_run:
             # Auto: align to a real trigger when one fires (so the trace falls
             # under the marker at every timescale), and only force-fire with c2

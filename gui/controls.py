@@ -142,7 +142,7 @@ class ControlsPanel(QWidget):
         self._normal_btn = QPushButton("Normal")
         self._normal_btn.setToolTip("Hold the display until a trigger edge matches")
         self._single_btn = QPushButton("Single")
-        self._single_btn.setToolTip("Free-run until one trigger fires, then freeze on it")
+        self._single_btn.setToolTip("Arm and wait for one trigger edge, then freeze on it")
         for btn, mode in ((self._auto_btn, "auto"), (self._normal_btn, "normal"),
                           (self._single_btn, "single")):
             btn.clicked.connect(lambda _, m=mode: self._on_acq_mode(m))
