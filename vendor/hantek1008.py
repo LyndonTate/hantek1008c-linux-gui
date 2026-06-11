@@ -216,13 +216,20 @@ class Hantek1008Raw:
         log.debug("c6%02x got %d bytes (trimmed from %d)", parameter, sample_length, len(samples))
         return samples[0:sample_length]
 
-    def __send_a55a_command(self, attempts: int=20) -> None:
+    def __send_a55a_command(self, attempts: int=20, force_after: Optional[int]=None) -> None:
         responses = []
         for i in range(attempts):
+            # force_after: let the ring buffer fill for a few polls, then send
+            # c2 (force capture) so free-run produces a frame even when no
+            # trigger edge matches. Natural triggers before the force are
+            # ignored so the waveform slides freely instead of locking onto a
+            # residual trigger level.
+            if force_after is not None and i == force_after:
+                self.__send_cmd(0xc2)
             response = self.__send_cmd(0xa5, parameter=[0x5a], response_length=1)
             assert response[0] in [0, 1, 2, 3]
             responses.append(response[0])
-            if response[0] in [2, 3]:
+            if response[0] in [2, 3] and (force_after is None or i >= force_after):
                 log.debug("a55a fired after %d polls, responses=%s (ns/div=%d)",
                          i + 1, responses, self.__ns_per_div)
                 return
@@ -471,9 +478,12 @@ class Hantek1008Raw:
         self.__send_cmd(0xc0)
 
         # Must wait for a502 (buffer frozen) before reading; reading a live
-        # buffer tears the c602/c603 halves. Free-run relies on the device
-        # auto-firing after a timeout, hence the larger poll budget.
-        self.__send_a55a_command(attempts=200 if self._free_run else 20)
+        # buffer tears the c602/c603 halves. Free-run forces the capture with
+        # c2 after a few polls so the frame slides freely with no trigger.
+        if self._free_run:
+            self.__send_a55a_command(attempts=200, force_after=7)
+        else:
+            self.__send_a55a_command(attempts=20)
 
         sample_response = self.__send_c6_a6_command(0x02)
         sample_response += self.__send_c6_a6_command(0x03)
