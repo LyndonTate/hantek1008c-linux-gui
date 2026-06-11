@@ -590,6 +590,14 @@ class Hantek1008Raw:
     # to follow the user's H-trigger marker — same mechanism as fast-fixed mode.
     # Windows varies A at 200µs (we've observed 64, 1440), but with our
     # software-slide display, fixing A=4000 is simpler and equally functional.
+    # Very-slow timebases (>=50ms/div): unlike 200µs the device does NOT clamp to
+    # its rate floor here — a3 sets a genuinely slow sample clock so the 4000-short
+    # buffer spans the full 10-div window (e.g. 2s at 200ms/div). A 3-position
+    # USBpcap of the vendor app shows trigger position is encoded entirely in A
+    # (A = 2*pre_samples, sweeping 0..8000) with B1=B2=1 held constant — the
+    # opposite of the 200µs path, which pins A and positions via the B1/B2 split.
+    # These timebases are handled by the dedicated A-positioned branch below.
+    _A_POSITIONED_NS = {50_000_000, 100_000_000, 200_000_000}
     _SLOW_BURST_B_SUM_OVERRIDES = {200_000: 1402}
     _SLOW_BURST_A_OVERRIDES = {200_000: 4000}
 
@@ -634,6 +642,18 @@ class Hantek1008Raw:
         n_ch = max(1, len(self.__active_channels))
         max_pre = 4000 // n_ch          # samples per channel the hardware can buffer
         capped = min(pre_samples, max_pre)
+        if self.__ns_per_div in Hantek1008Raw._A_POSITIONED_NS:
+            # Very-slow timebases: position the trigger via A (= 2*pre_samples,
+            # event lands at buffer index pre_samples) with B1=B2=1 held constant,
+            # matching the vendor. The full buffer spans the labeled window, so
+            # the GUI renders samples 0..frame_size and the event aligns under the
+            # H-trigger marker without any software slide.
+            A = max(0, min(2 * max_pre, 2 * capped))
+            B1 = B2 = 1
+            payload = A.to_bytes(2, 'big') + B1.to_bytes(3, 'big') + B2.to_bytes(3, 'big')
+            log.info("AC[a-positioned] ns/div=%d pre_req=%d n_ch=%d A=%d B1=%d B2=%d -> payload=%s",
+                     self.__ns_per_div, pre_samples, n_ch, A, B1, B2, payload.hex())
+            return payload
         B_SUM = Hantek1008Raw._slow_burst_b_sum(self.__ns_per_div)
         if self.__ns_per_div in Hantek1008Raw._SLOW_BURST_A_OVERRIDES:
             # Device-required fixed buffer size for this time-base. Trigger
