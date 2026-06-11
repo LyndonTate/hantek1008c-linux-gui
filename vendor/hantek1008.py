@@ -222,6 +222,23 @@ class Hantek1008Raw:
         log.debug("c6%02x got %d bytes (trimmed from %d)", parameter, sample_length, len(samples))
         return samples[0:sample_length]
 
+    __A55A_POLL_PERIOD_S = 0.02
+    __A55A_TIME_DIVS = 10
+
+    def __trigger_poll_budget(self) -> Tuple[int, int]:
+        """Return (attempts, force_after) scaled to the current time-base.
+
+        The device can't freeze its buffer until it has acquired a full frame
+        (ns_per_div * 10 divs of real time). At >=50ms/div that is 0.5-2s, so a
+        fixed budget makes Normal time out and Auto/Single force-fire before any
+        real edge can land. Both must scale with the frame duration.
+        """
+        frame_span_s = max(0.005, (self.__ns_per_div * self.__A55A_TIME_DIVS) / 1e9)
+        frame_polls = math.ceil(frame_span_s / self.__A55A_POLL_PERIOD_S)
+        force_after = max(7, frame_polls + 3)
+        attempts = max(force_after + 20, frame_polls * 2 + 20)
+        return attempts, force_after
+
     def __send_a55a_command(self, attempts: int=20, force_after: Optional[int]=None,
                             catch_natural: bool=False) -> bool:
         """Poll until the capture buffer freezes.
@@ -254,7 +271,7 @@ class Hantek1008Raw:
                               i + 1, self.__ns_per_div)
                     return True   # single mode: real trigger before the force
                 # auto mode: ignore natural triggers, keep polling until the force
-            sleep(0.02)
+            sleep(self.__A55A_POLL_PERIOD_S)
             self.__send_ping()
         log.warning("a55a never fired, responses=%s (ns/div=%d)",
                     responses, self.__ns_per_div)
@@ -502,16 +519,19 @@ class Hantek1008Raw:
         # buffer tears the c602/c603 halves. Free-run forces the capture with
         # c2 after a few polls so the frame slides freely with no trigger.
         if self._single_mode:
+            attempts, force_after = self.__trigger_poll_budget()
             self.last_capture_triggered = self.__send_a55a_command(
-                attempts=200, force_after=7, catch_natural=True)
+                attempts=attempts, force_after=force_after, catch_natural=True)
         elif self._free_run:
             # Auto: align to a real trigger when one fires (so the trace falls
             # under the marker at every timescale), and only force-fire with c2
             # as a timeout fallback so the display still updates with no edge.
+            attempts, force_after = self.__trigger_poll_budget()
             self.last_capture_triggered = self.__send_a55a_command(
-                attempts=200, force_after=7, catch_natural=True)
+                attempts=attempts, force_after=force_after, catch_natural=True)
         else:
-            self.last_capture_triggered = self.__send_a55a_command(attempts=20)
+            attempts, _ = self.__trigger_poll_budget()
+            self.last_capture_triggered = self.__send_a55a_command(attempts=attempts)
 
         sample_response = self.__send_c6_a6_command(0x02)
         sample_response += self.__send_c6_a6_command(0x03)
