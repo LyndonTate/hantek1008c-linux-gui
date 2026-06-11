@@ -158,6 +158,7 @@ class ScopeWindow(QMainWindow):
         self._zero_offsets = {}          # {vscale: [per-channel float]} from device calibration
         self._frame_size = 0
         self._last_frame_np = {}         # {ch_id: np.ndarray} cached for drag redraws
+        self._last_frame_triggered = False  # was the displayed frame a real trigger?
 
         self._setup_ui()
         self._start_acquisition()
@@ -299,9 +300,9 @@ class ScopeWindow(QMainWindow):
 
     def _redraw(self):
         ns = self._controls.get_ns_per_div()
-        if self._controls.is_free_run():
-            # Auto mode: no triggered alignment, just show the start of the buffer
-            # (force-fired captures slide freely; matched captures stay put).
+        if not self._last_frame_triggered:
+            # Free-run / single-preview: no trigger event to align to, just show
+            # the start of the buffer so the trace slides freely.
             start, end = 0, self._display_samples
         elif self._frame_size > self._display_samples:
             # The captured buffer is larger than the labeled time window — true
@@ -495,7 +496,7 @@ class ScopeWindow(QMainWindow):
             trigger_level=trig_adc,
             initial_pre_samples=initial_pre,
             device=self._device,
-            free_run=self._controls.is_free_run(),
+            capture_mode=self._controls.get_acq_mode(),
         )
         self._acq.new_frame.connect(self.on_new_frame)
         self._acq.device_ready.connect(self._on_device_ready)
@@ -506,19 +507,27 @@ class ScopeWindow(QMainWindow):
         if self._acq is not None:
             self._acq.stop()
             self._restarting = True       # discard any frames that arrive from here on
-            self._status_label.setText("● Updating")
-            self._status_label.setStyleSheet(
-                "color: #ffaa00; font-size: 11px; background-color: #111111;"
-                "border-bottom: 1px solid #333333;"
-            )
+            self._set_status("● Updating", "#ffaa00")
             QApplication.processEvents()  # paint the status indicator immediately
             self._acq.wait()
             QApplication.processEvents()  # drain signals queued while wait() was blocking
         self._start_acquisition()
+        if self._controls.get_acq_mode() == "stopped":
+            self._set_status("● Stopped", "#ff5555")
 
-    def on_new_frame(self, data):
+    def _set_status(self, text, color):
+        self._status_label.setText(text)
+        self._status_label.setStyleSheet(
+            f"color: {color}; font-size: 11px; background-color: #111111;"
+            "border-bottom: 1px solid #333333;"
+        )
+
+    def on_new_frame(self, data, triggered):
         if self._restarting:
             return                        # discard stale frames from the dying thread
+        mode = self._controls.get_acq_mode()
+        if mode == "stopped":
+            return                        # single-shot captured; display is frozen
 
         expected = set(self._controls.get_active_channels())
         # data may include silent partner channels (hardware pair padding); filter them out
@@ -531,17 +540,19 @@ class ScopeWindow(QMainWindow):
         if not self._initialized:
             self._init_buffer(frame_size)
             self._initialized = True
-            self._status_label.setText("● Live")
-            self._status_label.setStyleSheet(
-                "color: #44cc44; font-size: 11px; background-color: #111111;"
-                "border-bottom: 1px solid #333333;"
-            )
+            self._set_status("● Live", "#44cc44")
 
+        self._last_frame_triggered = triggered
         self._last_frame_np = {
             ch_id: np.asarray(samples_list, dtype=np.float32)
             for ch_id, samples_list in data.items()
         }
         self._redraw()
+
+        if mode == "single" and triggered:
+            # Real trigger caught — freeze on this frame and deselect all modes.
+            self._controls.clear_mode_selection()
+            self._set_status("● Stopped", "#ff5555")
 
     def _on_time_div_changed(self, ns):
         log.info("===== USER changed time/div -> %d ns/div =====", ns)
@@ -564,7 +575,11 @@ class ScopeWindow(QMainWindow):
         self._trigger_marker.setVisible(True)
         self._h_trigger_marker.setVisible(True)
         if self._acq is not None:
-            self._acq.set_free_run(self._controls.is_free_run())
+            self._acq.set_capture_mode(mode)
+        if mode == "single":
+            self._set_status("● Armed", "#ffaa00")
+        elif self._initialized:
+            self._set_status("● Live", "#44cc44")
 
     def _on_vscale_changed(self, ch_idx, vscale):
         self._update_yrange()

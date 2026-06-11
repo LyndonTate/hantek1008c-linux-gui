@@ -87,7 +87,7 @@ class ControlsPanel(QWidget):
     channel_toggled = pyqtSignal(int, bool)  # ch_idx, is_on
     vscale_changed = pyqtSignal(int, float)  # ch_idx, vscale
     trigger_channel_changed = pyqtSignal(int)  # ch_idx
-    acq_mode_changed = pyqtSignal(str)       # "auto" | "normal"
+    acq_mode_changed = pyqtSignal(str)       # "auto" | "normal" | "single"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,7 +139,10 @@ class ControlsPanel(QWidget):
         self._auto_btn.setToolTip("Free-run / scroll when no trigger edge matches")
         self._normal_btn = QPushButton("Normal")
         self._normal_btn.setToolTip("Hold the display until a trigger edge matches")
-        for btn, mode in ((self._auto_btn, "auto"), (self._normal_btn, "normal")):
+        self._single_btn = QPushButton("Single")
+        self._single_btn.setToolTip("Free-run until one trigger fires, then freeze on it")
+        for btn, mode in ((self._auto_btn, "auto"), (self._normal_btn, "normal"),
+                          (self._single_btn, "single")):
             btn.clicked.connect(lambda _, m=mode: self._on_acq_mode(m))
             mode_layout.addWidget(btn)
         layout.addWidget(mode_row)
@@ -247,9 +250,15 @@ class ControlsPanel(QWidget):
         self._update_mode_btn_styles()
         self.acq_mode_changed.emit(mode)
 
+    def clear_mode_selection(self):
+        """Deselect all mode buttons — used when a single-shot capture stops."""
+        self._acq_mode = "stopped"
+        self._update_mode_btn_styles()
+
     def _update_mode_btn_styles(self):
         self._auto_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "auto"))
         self._normal_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "normal"))
+        self._single_btn.setStyleSheet(_mode_btn_style(self._acq_mode == "single"))
 
     def _set_trigger_channel(self, ch_idx):
         self._trigger_ch = ch_idx
@@ -265,9 +274,6 @@ class ControlsPanel(QWidget):
 
     def get_acq_mode(self):
         return self._acq_mode
-
-    def is_free_run(self):
-        return self._acq_mode == "auto"
 
     def get_ns_per_div(self):
         return self._time_combo.currentData()

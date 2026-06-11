@@ -6,13 +6,13 @@ from vendor.hantek1008 import Hantek1008
 
 
 class AcquisitionThread(QThread):
-    new_frame = pyqtSignal(dict)
+    new_frame = pyqtSignal(dict, bool)  # (per-channel data, triggered)
     error = pyqtSignal(str)
     device_ready = pyqtSignal(dict)  # emits zero_offsets {vscale: [per-channel floats]}
 
     def __init__(self, ns_per_div=500_000, active_channels=None, vscales=None,
                  trigger_channel=0, trigger_slope="rising", trigger_level=2048,
-                 initial_pre_samples=2016, device=None, free_run=False, parent=None):
+                 initial_pre_samples=2016, device=None, capture_mode="auto", parent=None):
         super().__init__(parent)
         self._ns_per_div = ns_per_div
         self._active_channels = active_channels or [0]
@@ -21,12 +21,16 @@ class AcquisitionThread(QThread):
         self._trigger_slope = trigger_slope
         self._trigger_level = trigger_level
         self._initial_pre_samples = initial_pre_samples
-        self._free_run = free_run
+        self._capture_mode = capture_mode
         self._running = False
         self._stop_requested = False  # set by stop() to abort before entering the burst loop
         self._device = None
         # If an already-initialised device is supplied, we reuse it (no connect/init).
         self._existing_device = device
+
+    def _apply_capture_mode(self, device) -> None:
+        device.set_free_run(self._capture_mode == "auto")
+        device.set_single_mode(self._capture_mode == "single")
 
     def run(self):
         if self._existing_device is not None:
@@ -67,7 +71,7 @@ class AcquisitionThread(QThread):
                 self.error.emit(str(e))
                 return
 
-        device.set_free_run(self._free_run)
+        self._apply_capture_mode(device)
 
         self._running = True
         if self._stop_requested:
@@ -86,7 +90,7 @@ class AcquisitionThread(QThread):
                 # returns before a capture is ready)
                 if not data or any(len(v) == 0 for v in data.values()):
                     continue
-                self.new_frame.emit(data)
+                self.new_frame.emit(data, device.last_capture_triggered)
         finally:
             # ScopeWindow owns the device lifetime; we never close it here.
             self._device = None
@@ -99,10 +103,10 @@ class AcquisitionThread(QThread):
         if self._device is not None:
             self._device.queue_trigger_level(level)
 
-    def set_free_run(self, enabled: bool) -> None:
-        self._free_run = enabled
+    def set_capture_mode(self, mode: str) -> None:
+        self._capture_mode = mode
         if self._device is not None:
-            self._device.set_free_run(enabled)
+            self._apply_capture_mode(self._device)
 
     def stop(self):
         self._stop_requested = True

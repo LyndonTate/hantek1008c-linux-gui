@@ -119,10 +119,16 @@ class Hantek1008Raw:
         self.__trigger_level_lock = Lock()
 
         self._free_run: bool = False  # free-run / untriggered display (device auto-fires)
+        self._single_mode: bool = False  # single-shot: free-run preview but report the real trigger
+        self.last_capture_triggered: bool = False  # True if the last burst was a natural trigger
 
     def set_free_run(self, enabled: bool) -> None:
         """Enable free-run / untriggered display, relying on the device's auto-fire timeout."""
         self._free_run = enabled
+
+    def set_single_mode(self, enabled: bool) -> None:
+        """Single-shot capture: free-run preview that still reports when a real trigger fires."""
+        self._single_mode = enabled
 
     def connect(self) -> None:
         """Find a plugged in hantek 1008c device and set up the connection to it"""
@@ -216,23 +222,37 @@ class Hantek1008Raw:
         log.debug("c6%02x got %d bytes (trimmed from %d)", parameter, sample_length, len(samples))
         return samples[0:sample_length]
 
-    def __send_a55a_command(self, attempts: int=20, force_after: Optional[int]=None) -> None:
+    def __send_a55a_command(self, attempts: int=20, force_after: Optional[int]=None,
+                            catch_natural: bool=False) -> bool:
+        """Poll until the capture buffer freezes.
+
+        Returns True if a *natural* trigger fired, False if the capture was
+        forced (free-run preview). In auto mode (force_after set, catch_natural
+        False) natural triggers before the force are ignored so the waveform
+        slides freely; in single mode (catch_natural True) a natural trigger
+        before the force is reported so the caller can freeze on it.
+        """
         responses = []
         for i in range(attempts):
+            forced = force_after is not None and i >= force_after
             # force_after: let the ring buffer fill for a few polls, then send
             # c2 (force capture) so free-run produces a frame even when no
-            # trigger edge matches. Natural triggers before the force are
-            # ignored so the waveform slides freely instead of locking onto a
-            # residual trigger level.
+            # trigger edge matches.
             if force_after is not None and i == force_after:
                 self.__send_cmd(0xc2)
             response = self.__send_cmd(0xa5, parameter=[0x5a], response_length=1)
             assert response[0] in [0, 1, 2, 3]
             responses.append(response[0])
-            if response[0] in [2, 3] and (force_after is None or i >= force_after):
-                log.debug("a55a fired after %d polls, responses=%s (ns/div=%d)",
-                         i + 1, responses, self.__ns_per_div)
-                return
+            if response[0] in [2, 3]:
+                if forced:
+                    return False
+                if force_after is None:
+                    return True   # normal mode: only ever a natural trigger
+                if catch_natural:
+                    log.debug("a55a natural trigger after %d polls (ns/div=%d)",
+                              i + 1, self.__ns_per_div)
+                    return True   # single mode: real trigger before the force
+                # auto mode: ignore natural triggers, keep polling until the force
             sleep(0.02)
             self.__send_ping()
         log.warning("a55a never fired, responses=%s (ns/div=%d)",
@@ -480,10 +500,14 @@ class Hantek1008Raw:
         # Must wait for a502 (buffer frozen) before reading; reading a live
         # buffer tears the c602/c603 halves. Free-run forces the capture with
         # c2 after a few polls so the frame slides freely with no trigger.
-        if self._free_run:
-            self.__send_a55a_command(attempts=200, force_after=7)
+        if self._single_mode:
+            self.last_capture_triggered = self.__send_a55a_command(
+                attempts=200, force_after=7, catch_natural=True)
+        elif self._free_run:
+            self.last_capture_triggered = self.__send_a55a_command(
+                attempts=200, force_after=7)
         else:
-            self.__send_a55a_command(attempts=20)
+            self.last_capture_triggered = self.__send_a55a_command(attempts=20)
 
         sample_response = self.__send_c6_a6_command(0x02)
         sample_response += self.__send_c6_a6_command(0x03)
