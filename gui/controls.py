@@ -88,6 +88,7 @@ class ControlsPanel(QWidget):
     vscale_changed = pyqtSignal(int, float)  # ch_idx, vscale
     trigger_channel_changed = pyqtSignal(int)  # ch_idx
     acq_mode_changed = pyqtSignal(str)       # "auto" | "normal" | "single"
+    cursor_toggled = pyqtSignal(bool)        # measurement cursor on/off
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -100,6 +101,7 @@ class ControlsPanel(QWidget):
         # "auto" force-fires after a timeout (free-running scroll when no edge
         # matches); "normal" holds the display until a matching edge arrives.
         self._acq_mode = "auto"
+        self._cursor_on = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 8)
@@ -147,6 +149,21 @@ class ControlsPanel(QWidget):
             mode_layout.addWidget(btn)
         layout.addWidget(mode_row)
         self._update_mode_btn_styles()
+
+        sep_cur = QLabel()
+        sep_cur.setFixedHeight(1)
+        sep_cur.setStyleSheet("background-color: #333333; margin-top: 4px; margin-bottom: 2px;")
+        layout.addWidget(sep_cur)
+
+        lbl_cur = QLabel("Measurement")
+        lbl_cur.setStyleSheet("color: #888888; font-size: 11px;")
+        layout.addWidget(lbl_cur)
+
+        self._cursor_btn = QPushButton("Cursor")
+        self._cursor_btn.setToolTip("Crosshair + click-drag to measure Δt, ΔV and frequency")
+        self._cursor_btn.clicked.connect(self._on_cursor_toggle)
+        layout.addWidget(self._cursor_btn)
+        self._update_cursor_btn_style()
 
         sep2 = QLabel()
         sep2.setFixedHeight(1)
@@ -249,6 +266,17 @@ class ControlsPanel(QWidget):
         self._acq_mode = mode
         self._update_mode_btn_styles()
         self.acq_mode_changed.emit(mode)
+
+    def _on_cursor_toggle(self):
+        self._cursor_on = not self._cursor_on
+        self._update_cursor_btn_style()
+        self.cursor_toggled.emit(self._cursor_on)
+
+    def _update_cursor_btn_style(self):
+        self._cursor_btn.setStyleSheet(_mode_btn_style(self._cursor_on))
+
+    def is_cursor_enabled(self):
+        return self._cursor_on
 
     def clear_mode_selection(self):
         """Deselect all mode buttons — used when a single-shot capture stops."""

@@ -11,6 +11,7 @@ from PyQt6.QtCore import Qt
 from gui.controls import ControlsPanel, CHANNEL_COLORS
 from gui.acquisition import AcquisitionThread
 from gui.channel_margin import ChannelMarginWidget
+from gui.cursor_overlay import CursorOverlay
 
 TIME_DIVS = 10
 VOLT_DIVS = 8
@@ -146,6 +147,7 @@ class ScopeWindow(QMainWindow):
         self.resize(1280, 720)
 
         self._display_samples = 0
+        self._samples_per_div = 1.0
         self._initialized = False
         self._restarting = False         # True while switching timebases; discards stale frames
         self._channel_data = {}   # {ch_idx: {'curve': PlotDataItem}}
@@ -204,11 +206,14 @@ class ScopeWindow(QMainWindow):
         self._setup_trigger_marker()
         self._setup_h_trigger_marker()
 
+        self._cursor_overlay = CursorOverlay(self._plot_widget)
+
         self._controls.time_div_changed.connect(self._on_time_div_changed)
         self._controls.channel_toggled.connect(self._on_channel_toggled)
         self._controls.vscale_changed.connect(self._on_vscale_changed)
         self._controls.trigger_channel_changed.connect(self._on_trigger_channel_changed)
         self._controls.acq_mode_changed.connect(self._on_acq_mode_changed)
+        self._controls.cursor_toggled.connect(self._on_cursor_toggled)
 
         # The trigger markers are always active — the hardware trigger is always
         # armed. In auto mode the device free-runs when no edge matches.
@@ -396,7 +401,9 @@ class ScopeWindow(QMainWindow):
         ns_per_div = self._controls.get_ns_per_div()
         old_display_samples = self._display_samples
         self._display_samples, samples_per_div = self._compute_display_geometry(frame_size, ns_per_div)
+        self._samples_per_div = samples_per_div
         self._time_axis.set_timebase(ns_per_div, samples_per_div)
+        self._cursor_overlay.set_timebase(ns_per_div / samples_per_div if samples_per_div else 0.0)
         log.info("_init_buffer: ns/div=%d frame_size=%d -> display_samples=%d samples_per_div=%.2f (was display=%d)",
                  ns_per_div, frame_size, self._display_samples, samples_per_div, old_display_samples)
         is_first_init = self._frame_size == 0
@@ -584,6 +591,9 @@ class ScopeWindow(QMainWindow):
     def _on_vscale_changed(self, ch_idx, vscale):
         self._update_yrange()
         self._restart_acquisition()
+
+    def _on_cursor_toggled(self, enabled):
+        self._cursor_overlay.set_enabled(enabled)
 
     def _on_device_ready(self, zero_offsets):
         self._zero_offsets = zero_offsets
