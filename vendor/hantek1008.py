@@ -227,10 +227,11 @@ class Hantek1008Raw:
         """Poll until the capture buffer freezes.
 
         Returns True if a *natural* trigger fired, False if the capture was
-        forced (free-run preview). In auto mode (force_after set, catch_natural
-        False) natural triggers before the force are ignored so the waveform
-        slides freely; in single mode (catch_natural True) a natural trigger
-        before the force is reported so the caller can freeze on it.
+        forced. When catch_natural is True (auto and single modes) a natural
+        trigger before the force is reported so the caller can align the
+        display to it; the c2 force is only a timeout fallback so the frame
+        still updates when no edge matches. With catch_natural False the force
+        always wins and the capture is reported as untriggered.
         """
         responses = []
         for i in range(attempts):
@@ -504,8 +505,11 @@ class Hantek1008Raw:
             self.last_capture_triggered = self.__send_a55a_command(
                 attempts=200, force_after=7, catch_natural=True)
         elif self._free_run:
+            # Auto: align to a real trigger when one fires (so the trace falls
+            # under the marker at every timescale), and only force-fire with c2
+            # as a timeout fallback so the display still updates with no edge.
             self.last_capture_triggered = self.__send_a55a_command(
-                attempts=200, force_after=7)
+                attempts=200, force_after=7, catch_natural=True)
         else:
             self.last_capture_triggered = self.__send_a55a_command(attempts=20)
 
