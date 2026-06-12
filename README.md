@@ -14,7 +14,7 @@ https://github.com/user-attachments/assets/15a113a6-694e-49ce-842e-19c3c2059689
 
 - Up to 8 simultaneous channels, toggled on/off individually
 - Adjustable V/div per channel (10 mV – 5 V)
-- Adjustable time/div
+- Adjustable time/div (burst mode) or roll mode for slow signals (500 ms – 20 s/div)
 - Hardware trigger with selectable channel, rising/falling edge, level, and horizontal position
 - Auto / Normal / Single trigger modes
 - Measurement cursor for on-screen Δt, frequency, and ΔV readouts
@@ -53,7 +53,6 @@ python3 main.py
 
 ## Known limitations
 
-- No roll mode (continuous scrolling for slow signals)
 - No automatic measurements (Vpp, frequency, RMS, etc.)
 - No waveform export (CSV, image, etc.)
 
