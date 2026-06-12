@@ -9,6 +9,8 @@ _READOUT_BORDER = pg.mkPen(CURSOR_COLOR, width=1)
 
 def _format_time(ns: float) -> str:
     ns = abs(ns)
+    if ns >= 10_000_000_000:
+        return f"{ns / 1_000_000_000:.2f}s"
     if ns >= 1_000_000:
         return f"{ns / 1_000_000:.4g}ms"
     if ns >= 1_000:
