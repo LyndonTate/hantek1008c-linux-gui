@@ -409,9 +409,13 @@ class ScopeWindow(QMainWindow):
         """
         if Hantek1008.is_roll_mode_ns_per_div(ns_per_div):
             # Roll mode: the sample rate is fixed by the time-base, independent
-            # of any hardware buffer size. A div spans sampling_rate*seconds_per_div
-            # samples (~44 for both 500ms and 1s), so a 10-div screen holds ~440.
-            sampling_rate = Hantek1008.roll_sampling_rate_for_ns_per_div(ns_per_div)
+            # of any hardware buffer size. With fewer than 8 active channels the
+            # device actually streams faster than the nominal table rate (the
+            # single-channel factor is ~4.56x), so we scale by the hardware
+            # channel count to keep the time axis and sweep speed correct.
+            hw_active = _pad_channels_to_pairs(self._controls.get_active_channels())
+            n_hw = max(1, len(hw_active))
+            sampling_rate = Hantek1008.effective_roll_sampling_rate(ns_per_div, n_hw)
             samples_per_div = sampling_rate * ns_per_div / 1e9
             display_samples = max(1, int(round(TIME_DIVS * samples_per_div)))
             return display_samples, samples_per_div

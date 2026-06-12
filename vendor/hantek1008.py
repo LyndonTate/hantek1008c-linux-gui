@@ -69,12 +69,14 @@ class Hantek1008Raw:
     __burst_mode_ns_per_div_to_id_dic = {({0: 1, 1: 2, 2: 5}[id % 3] * 10 ** (id // 3)): id for id in range(26)}
     # Time-bases that use the device's continuous "roll" mode instead of the
     # one-shot burst buffer. Each maps to a roll-mode sampling rate (samples per
-    # second per channel) — see __roll_mode_sampling_rate_to_id_dic. The rates
-    # are chosen so a div always spans ~44 samples (10-div screen = ~440 samples):
-    #   500ms/div -> 88 Sa/s (a3 id 0x1a), 1s/div -> 44 Sa/s (a3 id 0x1b).
-    # Confirmed against wip/roll-mode-1s-500ms-500us.pcapng.
+    # second per channel) — see __roll_mode_sampling_rate_to_id_dic. The rate is
+    # the available roll rate closest to ~44 samples/div (10-div screen ≈ 440):
+    #   500ms->88, 1s->44, 2s->22, 5s->11, 10s->5, 20s->2 Sa/s.
+    # 500ms/1s confirmed against wip/roll-mode-1s-500ms-500us.pcapng; the slower
+    # time-bases use the same roll protocol with the corresponding a3 id.
     __roll_mode_ns_per_div_to_sampling_rate: Dict[int, float] = \
-        {500_000_000: 88, 1_000_000_000: 44}
+        {500_000_000: 88, 1_000_000_000: 44, 2_000_000_000: 22,
+         5_000_000_000: 11, 10_000_000_000: 5, 20_000_000_000: 2}
 
     def __init__(self, ns_per_div: int = 500_000,
                  vertical_scale_factor: Union[float, List[float]] = 1.0,
@@ -660,6 +662,15 @@ class Hantek1008Raw:
             log.info("AC[fast-fixed] ns/div=%d n_ch=%d A=%d B=%d -> payload=%s",
                      self.__ns_per_div, n_ch, A, B, payload.hex())
             return payload
+        if Hantek1008Raw.is_roll_mode_ns_per_div(self.__ns_per_div):
+            # Roll mode has no hardware trigger/pre-trigger — the actual roll
+            # arm sequence sends its own ac payloads (see __arm_roll_mode). This
+            # only runs from reconfigure()'s preamble; return the same benign
+            # payload (A=4000, B1=B2=1) so the slow-burst B_SUM (which for >1s
+            # overflows the 3-byte B fields) is never computed here.
+            payload = (4000).to_bytes(2, 'big') + (1).to_bytes(3, 'big') + (1).to_bytes(3, 'big')
+            log.info("AC[roll] ns/div=%d -> payload=%s", self.__ns_per_div, payload.hex())
+            return payload
         n_ch = max(1, len(self.__active_channels))
         max_pre = 4000 // n_ch          # samples per channel the hardware can buffer
         capped = min(pre_samples, max_pre)
@@ -791,6 +802,18 @@ class Hantek1008Raw:
         return Hantek1008Raw.__roll_mode_ns_per_div_to_sampling_rate[ns_per_div]
 
     @staticmethod
+    def effective_roll_sampling_rate(ns_per_div: int, active_channel_count: int) -> float:
+        """Actual roll-mode delivery rate (Sa/s/ch) for the given time-base.
+
+        With fewer than 8 active channels the device streams faster than the
+        nominal table rate by ``actual_sampling_rate_factor`` (e.g. ~4.56x for a
+        single channel). The GUI uses this to scale the time axis and the ring
+        buffer so the trace sweeps the screen in 10 * (ns_per_div) of real time.
+        """
+        nominal = Hantek1008Raw.__roll_mode_ns_per_div_to_sampling_rate[ns_per_div]
+        return nominal * Hantek1008Raw.actual_sampling_rate_factor(active_channel_count)
+
+    @staticmethod
     def valid_roll_mode_ns_per_divs() -> List[int]:
         return sorted(Hantek1008Raw.__roll_mode_ns_per_div_to_sampling_rate.keys())
 
@@ -828,9 +851,10 @@ class Hantek1008Raw:
             e4/e6, a3<id>, ac<A=4000,B=1,B=1>, ac<A=0,B=1,B=1>, a3<id>,
             ac<A=0,B=1,B=1>, a4 01, e4/e6, c0, a5 5a
 
-        The two B fields are held at 1 (the a3 id sets the actual sample rate),
-        and — unlike burst mode — there is no c2 force: the device free-runs and
-        streams samples that we drain with the c9/ca loop below.
+        The two B fields are held at 1 (the a3 id sets the actual sample rate).
+        At 500ms/1s the device free-runs after c0; at 2s and slower it must be
+        kicked with a c2 force (handled by the arm poll below) before it streams.
+        Samples are then drained with the c9/ca loop in request_samples_roll_mode.
         """
         sample_rate_id = Hantek1008Raw.__roll_mode_sampling_rate_to_id_dic[sampling_rate]
 
@@ -847,10 +871,27 @@ class Hantek1008Raw:
         self.__send_cmd(0xe4, parameter=[0x01])
         self.__send_cmd(0xe6, parameter=[0x01], echo_expected=False, response_length=10)
         self.__send_cmd(0xc0)
-        # Single arm poll — the device answers a5 01 (armed/idle); we don't wait
-        # for a frozen buffer in roll mode. The reply echoes the a5 opcode then
-        # one status byte (matches the burst-mode a55a read).
-        self.__send_cmd(0xa5, parameter=[0x5a], response_length=1)
+        # Arm poll. At 500ms/1s the device answers a5 01 (ready) at once and
+        # free-runs. At 2s and slower it answers a5 00 (not ready) and only
+        # becomes ready once a c2 force is sent (it never starts on its own) —
+        # see wip/roll-mode-2s-5s-10s-20s.pcapng, where the vendor polls a500
+        # for ~1.7s before a single c2 flips it to a501 and streaming begins.
+        # Without the c2 the device silently buffers a whole frame and then
+        # dribbles it out, which looks like extreme slow-motion playback. We
+        # force after a short settle, then re-force periodically (the device may
+        # ignore a c2 sent before its acquisition pipeline is ready) until it
+        # reports ready or we run out of budget.
+        start = time.monotonic()
+        next_force = start + 0.1
+        while time.monotonic() - start < 4.0:
+            response = self.__send_cmd(0xa5, parameter=[0x5a], response_length=1)
+            if response[0] != 0:
+                break
+            now = time.monotonic()
+            if now >= next_force:
+                self.__send_cmd(0xc2)
+                next_force = now + 0.5
+            self.__send_ping()
 
     def request_samples_roll_mode(self, sampling_rate: float = 440) \
             -> Generator[Dict[int, List[int]], None, None]:
