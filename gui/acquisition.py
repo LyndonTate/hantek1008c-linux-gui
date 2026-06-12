@@ -7,6 +7,7 @@ from vendor.hantek1008 import Hantek1008
 
 class AcquisitionThread(QThread):
     new_frame = pyqtSignal(dict, bool)  # (per-channel data, triggered)
+    roll_chunk = pyqtSignal(dict)       # roll mode: incremental per-channel volt samples
     error = pyqtSignal(str)
     device_ready = pyqtSignal(dict)  # emits zero_offsets {vscale: [per-channel floats]}
 
@@ -78,22 +79,44 @@ class AcquisitionThread(QThread):
             self._device = None
             return
         try:
-            while self._running:
-                try:
-                    data = device.request_samples_burst_mode()
-                except RuntimeError:
-                    # trigger level out of range — device timed out waiting for edge, retry
-                    continue
-                except Exception as e:
-                    raise
-                # Guard against empty frames (can occur in free-run mode if device
-                # returns before a capture is ready)
-                if not data or any(len(v) == 0 for v in data.values()):
-                    continue
-                self.new_frame.emit(data, device.last_capture_triggered)
+            if Hantek1008.is_roll_mode_ns_per_div(self._ns_per_div):
+                self._run_roll(device)
+            else:
+                self._run_burst(device)
         finally:
             # ScopeWindow owns the device lifetime; we never close it here.
             self._device = None
+
+    def _run_burst(self, device) -> None:
+        while self._running:
+            try:
+                data = device.request_samples_burst_mode()
+            except RuntimeError:
+                # trigger level out of range — device timed out waiting for edge, retry
+                continue
+            except Exception:
+                raise
+            # Guard against empty frames (can occur in free-run mode if device
+            # returns before a capture is ready)
+            if not data or any(len(v) == 0 for v in data.values()):
+                continue
+            self.new_frame.emit(data, device.last_capture_triggered)
+
+    def _run_roll(self, device) -> None:
+        # Continuous roll mode: drive the device's streaming generator and emit
+        # each incremental chunk of samples. Trigger/acquisition modes don't
+        # apply here — the device free-runs and we draw samples as they arrive.
+        sampling_rate = Hantek1008.roll_sampling_rate_for_ns_per_div(self._ns_per_div)
+        gen = device.request_samples_roll_mode(sampling_rate=sampling_rate, mode="volt")
+        try:
+            for data in gen:
+                if not self._running:
+                    break
+                if not data or any(len(v) == 0 for v in data.values()):
+                    continue
+                self.roll_chunk.emit(data)
+        finally:
+            gen.close()
 
     def queue_hw_trigger_pre_samples(self, pre_samples: int) -> None:
         if self._device is not None:

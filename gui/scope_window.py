@@ -12,6 +12,7 @@ from gui.controls import ControlsPanel, CHANNEL_COLORS
 from gui.acquisition import AcquisitionThread
 from gui.channel_margin import ChannelMarginWidget
 from gui.cursor_overlay import CursorOverlay
+from vendor.hantek1008 import Hantek1008
 
 TIME_DIVS = 10
 VOLT_DIVS = 8
@@ -119,6 +120,22 @@ class TimeAxisItem(pg.AxisItem):
     def set_timebase(self, ns_per_div: int, samples_per_div: float):
         self._ns_per_div = ns_per_div
         self._samples_per_div = max(samples_per_div, 1.0)
+        # Force the axis to recompute ticks/labels. Switching between two roll
+        # time-bases (e.g. 1s -> 500ms) keeps the same sample X-range, so
+        # pyqtgraph won't otherwise invalidate its cached tick picture.
+        self.picture = None
+        self.update()
+
+    def tickValues(self, minVal, maxVal, size):
+        # Place major ticks exactly on the division grid lines (multiples of
+        # samples_per_div) so the labels line up with the vertical grid.
+        if self._samples_per_div <= 0:
+            return super().tickValues(minVal, maxVal, size)
+        step = self._samples_per_div
+        first = int(np.ceil(minVal / step))
+        last = int(np.floor(maxVal / step))
+        ticks = [k * step for k in range(first, last + 1)]
+        return [(step, ticks)]
 
     def tickStrings(self, values, scale, spacing):
         if self._samples_per_div <= 0:
@@ -132,6 +149,8 @@ class TimeAxisItem(pg.AxisItem):
 
     @staticmethod
     def _format_time(ns: float) -> str:
+        if ns >= 1_000_000_000:
+            return f"{ns / 1_000_000_000:.3g}s"
         if ns >= 1_000_000:
             return f"{ns / 1_000_000:.3g}ms"
         if ns >= 1_000:
@@ -161,6 +180,13 @@ class ScopeWindow(QMainWindow):
         self._frame_size = 0
         self._last_frame_np = {}         # {ch_id: np.ndarray} cached for drag redraws
         self._last_frame_triggered = False  # was the displayed frame a real trigger?
+
+        # Roll mode (500ms, 1s/div): samples stream in and are drawn into a
+        # fixed-width ring buffer whose write head sweeps left->right, then wraps
+        # and overwrites in place — mirroring the vendor app's rolling trace.
+        self._roll_mode = False
+        self._roll_buf = {}              # {ch_id: np.ndarray} ring buffer of volts
+        self._roll_head = 0              # next write index into the ring buffers
 
         self._setup_ui()
         self._start_acquisition()
@@ -381,6 +407,15 @@ class ScopeWindow(QMainWindow):
         number of full divs that fit, so the labeled width stays accurate and
         no partial sample-stretching is needed.
         """
+        if Hantek1008.is_roll_mode_ns_per_div(ns_per_div):
+            # Roll mode: the sample rate is fixed by the time-base, independent
+            # of any hardware buffer size. A div spans sampling_rate*seconds_per_div
+            # samples (~44 for both 500ms and 1s), so a 10-div screen holds ~440.
+            sampling_rate = Hantek1008.roll_sampling_rate_for_ns_per_div(ns_per_div)
+            samples_per_div = sampling_rate * ns_per_div / 1e9
+            display_samples = max(1, int(round(TIME_DIVS * samples_per_div)))
+            return display_samples, samples_per_div
+
         if ns_per_div <= FAST_FIXED_NS_PER_DIV_MAX:
             actual_ns_per_sample = ADC_MIN_NS_PER_SAMPLE
         else:
@@ -484,6 +519,13 @@ class ScopeWindow(QMainWindow):
         trig_adc = self._volts_to_adc(self._trigger_level_volts, vscales_dict[trig_ch], trig_ch)
 
         self._initialized = False
+        self._roll_mode = Hantek1008.is_roll_mode_ns_per_div(ns)
+        # Trigger / horizontal-trigger markers are meaningless in roll mode
+        # (the device free-runs and streams), so hide them while rolling.
+        self._trigger_marker.setVisible(not self._roll_mode)
+        self._h_trigger_marker.setVisible(not self._roll_mode)
+        self._roll_buf = {}
+        self._roll_head = 0
 
         # The hardware buffer holds 4000 shorts total; with N channels interleaved
         # each channel gets 4000/N samples per burst.
@@ -507,6 +549,7 @@ class ScopeWindow(QMainWindow):
             capture_mode=self._controls.get_acq_mode(),
         )
         self._acq.new_frame.connect(self.on_new_frame)
+        self._acq.roll_chunk.connect(self.on_roll_chunk)
         self._acq.device_ready.connect(self._on_device_ready)
         self._acq.error.connect(self._on_error)
         self._acq.start()
@@ -562,6 +605,103 @@ class ScopeWindow(QMainWindow):
             self._controls.clear_mode_selection()
             self._set_status("● Stopped", "#ff5555")
 
+    def _init_roll_display(self):
+        """Set up the rolling-trace display: time-base, grid, curves and the
+        per-channel ring buffers that the sweeping write head fills."""
+        ns_per_div = self._controls.get_ns_per_div()
+        self._display_samples, samples_per_div = self._compute_display_geometry(0, ns_per_div)
+        self._samples_per_div = samples_per_div
+        self._frame_size = self._display_samples
+        self._time_axis.set_timebase(ns_per_div, samples_per_div)
+        self._cursor_overlay.set_timebase(ns_per_div / samples_per_div if samples_per_div else 0.0)
+        log.info("_init_roll_display: ns/div=%d -> display_samples=%d samples_per_div=%.2f",
+                 ns_per_div, self._display_samples, samples_per_div)
+
+        self._plot_widget.setXRange(0, self._display_samples - 1, padding=0)
+
+        pi = self._plot_widget.getPlotItem()
+        grid_pen = pg.mkPen(GRID_COLOR, width=1)
+        for line in self._v_grid_lines:
+            pi.removeItem(line)
+        self._v_grid_lines.clear()
+        for i in range(1, TIME_DIVS):
+            pos = i * samples_per_div
+            if pos >= self._display_samples:
+                break
+            line = pg.InfiniteLine(pos=pos, angle=90, pen=grid_pen, movable=False)
+            pi.addItem(line)
+            self._v_grid_lines.append(line)
+
+        for info in self._channel_data.values():
+            self._plot_widget.removeItem(info["curve"])
+        self._channel_data.clear()
+        self._roll_buf = {}
+        self._roll_head = 0
+
+        active = self._controls.get_active_channels()
+        for ch in active:
+            color = CHANNEL_COLORS[ch]
+            offset = self._channel_offsets.get(ch, 0.0)
+            # connect="finite" so the unfilled (NaN) part of the buffer and the
+            # sweeping head gap render as gaps rather than spurious lines.
+            curve = self._plot_widget.plot(pen=pg.mkPen(color, width=1), connect="finite")
+            curve.setPos(0, offset)
+            self._channel_data[ch] = {"curve": curve}
+            self._roll_buf[ch] = np.full(self._display_samples, np.nan, dtype=np.float32)
+
+        vscales_dict = self._controls.get_vscales()
+        active_vscales = [vscales_dict[ch] for ch in active]
+        yrange = _yrange_for(active_vscales)
+        margin_channels = {ch: (self._channel_offsets.get(ch, 0.0), CHANNEL_COLORS[ch])
+                           for ch in active}
+        self._ch_margin.set_channels(margin_channels, yrange)
+
+    def on_roll_chunk(self, data):
+        if self._restarting or not self._roll_mode:
+            return
+
+        expected = set(self._controls.get_active_channels())
+        # filter out silent partner channels from hardware pair padding
+        data = {k: v for k, v in data.items() if k in expected}
+        if set(data.keys()) != expected:
+            return
+
+        if not self._initialized:
+            self._init_roll_display()
+            self._initialized = True
+            self._set_status("● Roll", "#44cc44")
+
+        n = self._display_samples
+        # All active channels advance together, so the chunk length is the same
+        # for each; use the shortest to stay in lock-step.
+        count = min(len(v) for v in data.values())
+        if count == 0:
+            return
+
+        head = self._roll_head
+        for ch, samples in data.items():
+            buf = self._roll_buf.get(ch)
+            if buf is None:
+                continue
+            arr = np.asarray(samples[:count], dtype=np.float32)
+            idx = (head + np.arange(count)) % n
+            buf[idx] = arr
+
+        self._roll_head = (head + count) % n
+        # Blank a couple of samples just ahead of the write head so the sweep
+        # point reads as a moving gap, like the vendor app.
+        gap = (self._roll_head + np.arange(2)) % n
+        for buf in self._roll_buf.values():
+            buf[gap] = np.nan
+
+        self._redraw_roll()
+
+    def _redraw_roll(self):
+        for ch, buf in self._roll_buf.items():
+            info = self._channel_data.get(ch)
+            if info is not None:
+                info["curve"].setData(buf, connect="finite")
+
     def _on_time_div_changed(self, ns):
         log.info("===== USER changed time/div -> %d ns/div =====", ns)
         self._restart_acquisition()
@@ -583,10 +723,14 @@ class ScopeWindow(QMainWindow):
         self._restart_acquisition()
 
     def _on_acq_mode_changed(self, mode):
-        self._trigger_marker.setVisible(True)
-        self._h_trigger_marker.setVisible(True)
+        if not self._roll_mode:
+            # Trigger markers stay hidden while rolling (no trigger applies).
+            self._trigger_marker.setVisible(True)
+            self._h_trigger_marker.setVisible(True)
         if self._acq is not None:
             self._acq.set_capture_mode(mode)
+        if self._roll_mode:
+            return                            # acquisition mode has no effect in roll mode
         if mode == "single":
             self._set_status("● Armed", "#ffaa00")
         elif self._initialized:

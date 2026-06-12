@@ -8,6 +8,7 @@ NS_PER_DIV_VALUES = [
     1_000_000, 2_000_000, 5_000_000,
     10_000_000, 20_000_000, 50_000_000,
     100_000_000, 200_000_000,
+    500_000_000, 1_000_000_000,  # roll mode (500ms, 1s)
 ]
 
 VSCALE_OPTIONS = [
@@ -34,9 +35,12 @@ def fmt_ns(ns):
     elif ns < 1_000_000:
         v = ns / 1_000
         return f"{v:g}µs"
-    else:
+    elif ns < 1_000_000_000:
         v = ns / 1_000_000
         return f"{v:g}ms"
+    else:
+        v = ns / 1_000_000_000
+        return f"{v:g}s"
 
 
 _COMBO_STYLE = """
