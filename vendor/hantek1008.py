@@ -535,23 +535,20 @@ class Hantek1008Raw:
         # buffer tears the c602/c603 halves. Free-run forces the capture with
         # c2 after a few polls so the frame slides freely with no trigger.
         if self._single_mode:
-            # Single-shot: wait for a *genuine* trigger and never force-fire.
-            # Using force_after here created a race — once the c2 force was sent
-            # the device could no longer distinguish a natural freeze from the
-            # forced one, so any edge landing at/after force_after was reported
-            # untriggered and the GUI failed to freeze. Polling like Normal (no
-            # force, RuntimeError -> retry in the acquisition loop) makes the
-            # capture report True on the first real edge every time, so the GUI
-            # freezes reliably.
+            # Single-shot: wait for a genuine trigger, no force-fire.
             attempts, _ = self.__trigger_poll_budget()
             self.last_capture_triggered = self.__send_a55a_command(attempts=attempts)
         elif self._free_run:
-            # Auto: align to a real trigger when one fires (so the trace falls
-            # under the marker at every timescale), and only force-fire with c2
-            # as a timeout fallback so the display still updates with no edge.
-            attempts, force_after = self.__trigger_poll_budget()
-            self.last_capture_triggered = self.__send_a55a_command(
-                attempts=attempts, force_after=force_after, catch_natural=True)
+            # Auto/free-run: try to catch a natural trigger with a short timeout
+            # (3 polls ≈ 60 ms — enough for any signal ≥ ~17 Hz).  If the trigger
+            # doesn't fire (DC or very slow signal) fall through and read anyway;
+            # the ring-buffer glitch at the read boundary is acceptable for those
+            # cases.  Using a large attempts+c2 budget here caused 27-poll timeouts
+            # (~540 ms per frame) that crashed the GUI on channel toggles.
+            try:
+                self.last_capture_triggered = self.__send_a55a_command(attempts=3)
+            except RuntimeError:
+                self.last_capture_triggered = False
         else:
             attempts, _ = self.__trigger_poll_budget()
             self.last_capture_triggered = self.__send_a55a_command(attempts=attempts)
@@ -740,6 +737,11 @@ class Hantek1008Raw:
         log.info("reconfigure: ns/div=%d active_ch=%s vscales=%s trig_ch=%d slope=%s level=%d pre=%d",
                  ns_per_div, active_channels, vscales, trigger_channel,
                  trigger_slope, trigger_level, pre_samples)
+        # Drain any stale IN-endpoint data left by an interrupted burst (e.g. if
+        # the acquisition thread was stopped mid-a55a or mid-c6 read).  Without
+        # this the first f6 command below reads the leftover byte instead of its
+        # own echo, causing a protocol mismatch that leads to EBUSY or errors.
+        self.__clear_leftover()
         self.__active_channels = sorted(copy.deepcopy(active_channels))
         self.__vertical_scale_factors = copy.deepcopy(vscales)
         self.__ns_per_div = ns_per_div

@@ -54,23 +54,34 @@ class AcquisitionThread(QThread):
                 self.error.emit(str(e))
                 return
         else:
-            try:
-                device = Hantek1008(
-                    ns_per_div=self._ns_per_div,
-                    vertical_scale_factor=self._vscales,
-                    active_channels=self._active_channels,
-                    trigger_channel=self._trigger_channel,
-                    trigger_slope=self._trigger_slope,
-                    trigger_level=self._trigger_level,
-                )
-                device.queue_hw_trigger_pre_samples(self._initial_pre_samples)
-                device.connect()
-                device.init()
-                self._device = device
-                self.device_ready.emit(device.get_zero_offsets())
-            except Exception as e:
-                self.error.emit(str(e))
+            # Retry up to 3× to handle USB re-enumeration after a device reset
+            # (the device briefly disappears then reappears on the bus).
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    device = Hantek1008(
+                        ns_per_div=self._ns_per_div,
+                        vertical_scale_factor=self._vscales,
+                        active_channels=self._active_channels,
+                        trigger_channel=self._trigger_channel,
+                        trigger_slope=self._trigger_slope,
+                        trigger_level=self._trigger_level,
+                    )
+                    device.queue_hw_trigger_pre_samples(self._initial_pre_samples)
+                    device.connect()
+                    device.init()
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    if attempt < 2:
+                        from time import sleep as _sleep
+                        _sleep(1.5)
+            if last_exc is not None:
+                self.error.emit(str(last_exc))
                 return
+            self._device = device
+            self.device_ready.emit(device.get_zero_offsets())
 
         self._apply_capture_mode(device)
 
@@ -83,6 +94,8 @@ class AcquisitionThread(QThread):
                 self._run_roll(device)
             else:
                 self._run_burst(device)
+        except Exception as e:
+            self.error.emit(str(e))
         finally:
             # ScopeWindow owns the device lifetime; we never close it here.
             self._device = None
@@ -95,7 +108,7 @@ class AcquisitionThread(QThread):
                 # trigger level out of range — device timed out waiting for edge, retry
                 continue
             except Exception:
-                raise
+                raise  # caught by outer try/except which emits error signal
             # Guard against empty frames (can occur in free-run mode if device
             # returns before a capture is ready)
             if not data or any(len(v) == 0 for v in data.values()):

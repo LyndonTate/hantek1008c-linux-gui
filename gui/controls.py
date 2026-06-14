@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, QTimer
 
 NS_PER_DIV_VALUES = [
     1, 2, 5, 10, 20, 50, 100, 200, 500,
@@ -95,6 +95,7 @@ class ControlsPanel(QWidget):
     trigger_slope_changed = pyqtSignal(str)  # "rising" | "falling"
     acq_mode_changed = pyqtSignal(str)       # "auto" | "normal" | "single"
     cursor_toggled = pyqtSignal(bool)        # measurement cursor on/off
+    autoset_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -129,6 +130,33 @@ class ControlsPanel(QWidget):
         self._time_combo.setCurrentIndex(default_idx)
         self._time_combo.currentIndexChanged.connect(self._on_time_div)
         layout.addWidget(self._time_combo)
+
+        autoset_row = QWidget()
+        autoset_row.setStyleSheet("background-color: transparent;")
+        autoset_layout = QHBoxLayout(autoset_row)
+        autoset_layout.setContentsMargins(0, 0, 0, 0)
+        autoset_layout.setSpacing(4)
+        self._autoset_btn = QPushButton("AUTO")
+        self._autoset_btn.setStyleSheet(
+            "background-color: #1a3a5c; color: #88aaff; border: 1px solid #335577; "
+            "padding: 3px 6px; font-size: 11px; font-weight: bold;"
+        )
+        self._autoset_btn.setToolTip("Auto-detect signal frequency and set timebase")
+        self._autoset_btn.clicked.connect(self.autoset_requested)
+        autoset_layout.addWidget(self._autoset_btn)
+        self._autoset_ref_combo = QComboBox()
+        self._autoset_ref_combo.setStyleSheet(_COMBO_STYLE)
+        self._autoset_ref_combo.setToolTip("Reference channel for AutoSet detection")
+        self._autoset_ref_combo.addItem("->Ref: All", None)
+        for i in range(8):
+            self._autoset_ref_combo.addItem(f"->Ref: CH{i + 1}", i)
+        autoset_layout.addWidget(self._autoset_ref_combo)
+        layout.addWidget(autoset_row)
+
+        self._spinner_idx = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(150)
+        self._spinner_timer.timeout.connect(self._on_spinner_tick)
 
         sep = QLabel()
         sep.setFixedHeight(1)
@@ -351,3 +379,28 @@ class ControlsPanel(QWidget):
 
     def get_vscales(self):
         return dict(self._vscales)
+
+    def set_ns_per_div(self, ns: int):
+        for i in range(self._time_combo.count()):
+            if self._time_combo.itemData(i) == ns:
+                self._time_combo.setCurrentIndex(i)
+                return
+
+    _SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+
+    def start_autoset_animation(self):
+        self._spinner_idx = 0
+        self._autoset_btn.setText(self._SPINNER_FRAMES[0])
+        self._spinner_timer.start()
+
+    def stop_autoset_animation(self):
+        self._spinner_timer.stop()
+        self._autoset_btn.setText("AUTO")
+
+    def _on_spinner_tick(self):
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._SPINNER_FRAMES)
+        self._autoset_btn.setText(self._SPINNER_FRAMES[self._spinner_idx])
+
+    def get_autoset_ref_channel(self):
+        """Return the channel index (0-7) to use as AutoSet reference, or None for all channels."""
+        return self._autoset_ref_combo.currentData()

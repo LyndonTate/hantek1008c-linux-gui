@@ -6,9 +6,9 @@ import pyqtgraph as pg
 log = logging.getLogger(__name__)
 from PyQt6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QApplication
 from PyQt6.QtGui import QFont
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
-from gui.controls import ControlsPanel, CHANNEL_COLORS
+from gui.controls import ControlsPanel, CHANNEL_COLORS, NS_PER_DIV_VALUES
 from gui.acquisition import AcquisitionThread
 from gui.channel_margin import ChannelMarginWidget
 from gui.cursor_overlay import CursorOverlay
@@ -46,6 +46,48 @@ _INTERP_THRESHOLD = 600      # apply smoothing+interpolation only when display_s
 _INTERP_FACTOR = 10          # output 10 points per input segment
 # 5-tap Gaussian (sigma≈1.0); sums to 1.0
 _SMOOTH_KERNEL = np.array([0.06136, 0.24477, 0.38774, 0.24477, 0.06136])
+
+
+# AutoSet quality gates
+_AUTOSET_MIN_AMPLITUDE = 4  # ADC counts peak-to-peak (~5 % of 12-bit range)
+_AUTOSET_MIN_CYCLES = 5         # need this many complete cycles in the buffer
+
+def _reject_spikes(y: np.ndarray) -> np.ndarray:
+    """3-point median filter: eliminates single-sample ADC spikes for display.
+
+    Has zero effect on well-sampled signals (median of 3 consecutive points of
+    a smooth waveform equals the middle point), but replaces isolated outliers
+    with the average of their neighbours.
+    """
+    if len(y) < 3:
+        return y
+    out = y.copy()
+    out[1:-1] = np.median(np.stack([y[:-2], y[1:-1], y[2:]]), axis=0)
+    return out
+
+
+def _estimate_period_ns(samples: np.ndarray, ns_per_sample: float):
+    """Estimate signal period in ns via rising zero-crossing intervals.
+
+    Returns None when the signal doesn't look periodic (too small, too few
+    cycles, or crossing intervals too irregular / noisy).
+    """
+    peak_to_peak = float(samples.max()) - float(samples.min())
+    if peak_to_peak < _AUTOSET_MIN_AMPLITUDE:
+        return None
+
+    mid = (float(samples.max()) + float(samples.min())) / 2
+    above = samples > mid
+    crossings = np.where(np.diff(above.astype(np.int8)) == 1)[0]
+    if len(crossings) < _AUTOSET_MIN_CYCLES + 1:
+        return None
+
+    intervals = np.diff(crossings).astype(float)
+    mean_iv = float(np.mean(intervals))
+    if mean_iv == 0:
+        return None
+
+    return float(np.median(intervals)) * ns_per_sample
 
 
 def _smooth_and_upsample(y: np.ndarray, factor: int = _INTERP_FACTOR) -> np.ndarray:
@@ -169,6 +211,11 @@ class ScopeWindow(QMainWindow):
         self._samples_per_div = 1.0
         self._initialized = False
         self._restarting = False         # True while switching timebases; discards stale frames
+        self._restart_in_progress = False  # re-entrancy guard for _restart_acquisition
+        self._pending_restart = False      # a restart was requested while one was in progress
+        self._autoset_searching = False  # True while iterating through timebases looking for signal
+        self._autoset_changing_timebase = False  # suppress search cancel during autoset-driven restarts
+        self._autoset_current_idx = 0   # current index into NS_PER_DIV_VALUES during search
         self._channel_data = {}   # {ch_idx: {'curve': PlotDataItem}}
         self._channel_offsets = {}       # {ch_idx: float} display-only Y offset in volts
         self._h_grid_lines = []
@@ -241,9 +288,8 @@ class ScopeWindow(QMainWindow):
         self._controls.trigger_slope_changed.connect(self._on_trigger_slope_changed)
         self._controls.acq_mode_changed.connect(self._on_acq_mode_changed)
         self._controls.cursor_toggled.connect(self._on_cursor_toggled)
+        self._controls.autoset_requested.connect(self._on_autoset)
 
-        # The trigger markers are always active — the hardware trigger is always
-        # armed. In auto mode the device free-runs when no edge matches.
         self._on_acq_mode_changed(self._controls.get_acq_mode())
 
     def _setup_plot(self):
@@ -354,7 +400,7 @@ class ScopeWindow(QMainWindow):
         for ch_id, samples in self._last_frame_np.items():
             if ch_id not in self._channel_data:
                 continue
-            window = samples[start:end]
+            window = _reject_spikes(samples[start:end])
             if len(window) < _INTERP_THRESHOLD and len(window) >= 2:
                 y = _smooth_and_upsample(window)
                 x = np.linspace(0, len(window) - 1, len(y))
@@ -559,16 +605,26 @@ class ScopeWindow(QMainWindow):
         self._acq.start()
 
     def _restart_acquisition(self):
-        if self._acq is not None:
-            self._acq.stop()
-            self._restarting = True       # discard any frames that arrive from here on
-            self._set_status("● Updating", "#ffaa00")
-            QApplication.processEvents()  # paint the status indicator immediately
-            self._acq.wait()
-            QApplication.processEvents()  # drain signals queued while wait() was blocking
-        self._start_acquisition()
-        if self._controls.get_acq_mode() == "stopped":
-            self._set_status("● Stopped", "#ff5555")
+        if self._restart_in_progress:
+            self._pending_restart = True
+            return
+        self._restart_in_progress = True
+        self._pending_restart = False
+        try:
+            if self._acq is not None:
+                self._acq.stop()
+                self._restarting = True
+                self._set_status("● Updating", "#ffaa00")
+                QApplication.processEvents()
+                self._acq.wait()
+                QApplication.processEvents()
+            self._start_acquisition()
+            if self._controls.get_acq_mode() == "stopped":
+                self._set_status("● Stopped", "#ff5555")
+        finally:
+            self._restart_in_progress = False
+            if self._pending_restart:
+                QTimer.singleShot(0, self._restart_acquisition)
 
     def _set_status(self, text, color):
         self._status_label.setText(text)
@@ -603,11 +659,71 @@ class ScopeWindow(QMainWindow):
             for ch_id, samples_list in data.items()
         }
         self._redraw()
+        if self._autoset_searching:
+            QTimer.singleShot(0, self._autoset_step)
 
-        if mode == "single" and triggered:
-            # Real trigger caught — freeze on this frame and deselect all modes.
-            self._controls.clear_mode_selection()
-            self._set_status("● Stopped", "#ff5555")
+    def _begin_autoset(self):
+        self._autoset_searching = True
+        self._controls.start_autoset_animation()
+
+    def _end_autoset(self):
+        self._autoset_searching = False
+        self._controls.stop_autoset_animation()
+
+    def _on_autoset(self):
+        if not self._last_frame_np or self._frame_size == 0:
+            return
+        ns_per_div = self._controls.get_ns_per_div()
+        try:
+            self._autoset_current_idx = NS_PER_DIV_VALUES.index(ns_per_div)
+        except ValueError:
+            self._autoset_current_idx = 0
+        self._begin_autoset()
+        self._autoset_step()
+
+    def _autoset_step(self):
+        ns_per_div = self._controls.get_ns_per_div()
+        if ns_per_div <= FAST_FIXED_NS_PER_DIV_MAX:
+            ns_per_sample = ADC_MIN_NS_PER_SAMPLE
+        else:
+            ns_per_sample = max(
+                (ns_per_div * TIME_DIVS) / self._frame_size,
+                SLOW_BURST_NS_PER_SAMPLE,
+            )
+        ref_ch = self._controls.get_autoset_ref_channel()
+        if ref_ch is not None:
+            candidates = {k: v for k, v in self._last_frame_np.items() if k == ref_ch}
+        else:
+            candidates = self._last_frame_np
+        periods = [
+            p for p in (
+                _estimate_period_ns(samples, ns_per_sample)
+                for samples in candidates.values()
+            )
+            if p is not None
+        ]
+        if periods:
+            period_ns = float(np.median(periods))
+            target_ns_per_div = period_ns * 5 / TIME_DIVS  # show ~5 full cycles
+            best = min(NS_PER_DIV_VALUES, key=lambda v: abs(v - target_ns_per_div))
+            log.info("AutoSet: found period=%.1f ns at %d ns/div -> best=%d ns/div",
+                     period_ns, ns_per_div, best)
+            self._end_autoset()
+            self._autoset_changing_timebase = True
+            self._controls.set_ns_per_div(best)
+            self._autoset_changing_timebase = False
+        else:
+            next_idx = self._autoset_current_idx + 1
+            if next_idx >= len(NS_PER_DIV_VALUES):
+                log.info("AutoSet: no signal found at max timebase, giving up")
+                self._end_autoset()
+            else:
+                next_ns = NS_PER_DIV_VALUES[next_idx]
+                log.info("AutoSet: no signal at %d ns/div, trying %d ns/div", ns_per_div, next_ns)
+                self._autoset_current_idx = next_idx
+                self._autoset_changing_timebase = True
+                self._controls.set_ns_per_div(next_ns)
+                self._autoset_changing_timebase = False
 
     def _init_roll_display(self):
         """Set up the rolling-trace display: time-base, grid, curves and the
@@ -707,7 +823,9 @@ class ScopeWindow(QMainWindow):
                 info["curve"].setData(buf, connect="finite")
 
     def _on_time_div_changed(self, ns):
-        log.info("===== USER changed time/div -> %d ns/div =====", ns)
+        if not self._autoset_changing_timebase:
+            self._end_autoset()  # user manually changed timebase; cancel any search
+        log.info("===== time/div -> %d ns/div (autoset=%s) =====", ns, self._autoset_searching)
         self._restart_acquisition()
 
     def _on_channel_toggled(self, ch_idx, is_on):
@@ -749,12 +867,36 @@ class ScopeWindow(QMainWindow):
 
     def _on_device_ready(self, zero_offsets):
         self._zero_offsets = zero_offsets
-        self._device = self._acq._device  # keep a reference for reconfiguration on next restart
+        # Guard: _acq._device is set to None in the thread's finally block when it
+        # exits.  A device_ready signal queued before exit and processed after it
+        # (during QApplication.processEvents() in _restart_acquisition) must not
+        # overwrite self._device with None, which would force an unnecessary full
+        # USB reconnect on the next restart and trigger EBUSY.
+        dev = self._acq._device
+        if dev is not None:
+            self._device = dev
 
     def _on_error(self, msg):
+        self._end_autoset()
         print(f"Device error: {msg}", file=sys.stderr)
-        # Invalidate the cached device so the next restart does a full connect/init.
-        self._device = None
+        if self._device is not None:
+            # Do NOT call close() here — it sends a USB reset which causes the
+            # device to briefly disappear (ENODEV) and then re-enumerate, making
+            # the next connect() fail with EBUSY.  Just drop the reference and
+            # force GC so pyusb releases the interface claim before the reconnect.
+            self._device = None
+            import gc
+            gc.collect()
+        disconnected = "19" in msg or "No such device" in msg
+        label, color = ("● Disconnected", "#ff6666") if disconnected else ("● Error", "#ff6666")
+        self._status_label.setText(label)
+        self._status_label.setStyleSheet(
+            f"color: {color}; font-size: 11px; background-color: #111111;"
+            "border-bottom: 1px solid #333333;"
+        )
+        if disconnected:
+            # Retry automatically — the device re-enumerates after a brief pause.
+            QTimer.singleShot(2000, self._restart_acquisition)
 
     def closeEvent(self, event):
         if self._acq is not None:
