@@ -221,7 +221,7 @@ class ControlsPanel(QWidget):
         lbl_auto.setStyleSheet("color: #666666; font-size: 10px; margin-top: 4px;")
         lbl_auto.setToolTip(
             "One row per measure. Dots = channels (click one, or the label for all active). "
-            "Live values show on the plot overlay. Only Frequency is computed so far."
+            "Live values show on the plot overlay."
         )
         layout.addWidget(lbl_auto)
 
