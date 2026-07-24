@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/15a113a6-694e-49ce-842e-19c3c2059689
 - Hardware trigger with selectable channel, rising/falling edge, level, and horizontal position
 - Auto / Normal / Single trigger modes
 - Measurement cursor for on-screen Δt, frequency, and ΔV readouts
+- Per-channel auto measurements (Freq, Period, ±Duty, ±PW, Rise/Fall, Max/Min, PkPk, Top/Base, Mid, Amp, Mean, RMS, Cycle Mean, ±Overshoot) with plot overlay
 - Draggable channel offset handles in a left margin strip
 - Channels stagger vertically on first enable so they don't stack on zero
 
@@ -53,7 +54,6 @@ python3 main.py
 
 ## Known limitations
 
-- No automatic measurements (Vpp, frequency, RMS, etc.)
 - No waveform export (CSV, image, etc.)
 
 ## Project structure
