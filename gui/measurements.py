@@ -12,8 +12,8 @@ MEASURE_GROUPS = [
         # ("pw_neg", "−PW", "− Pulse Width"),
     ]),
     ("vertical", "Vertical", [
-        # ("vmax", "Max", "Maximum"),
-        # ("vmin", "Min", "Minimum"),
+        ("vmax", "Max", "Maximum"),
+        ("vmin", "Min", "Minimum"),
         ("vpp", "PkPk", "Peak to Peak"),
         # ("vtop", "Top", "Top"),
         # ("vbase", "Base", "Base"),
@@ -114,15 +114,33 @@ def measure_vpp(samples, ns_per_sample):
     return float(y.max() - y.min())
 
 
+def measure_vmax(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 1:
+        return None
+    return float(y.max())
+
+
+def measure_vmin(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 1:
+        return None
+    return float(y.min())
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "vpp": measure_vpp,
+    "vmax": measure_vmax,
+    "vmin": measure_vmin,
 }
 
 
 _FORMATTERS = {
     "freq": format_freq,
     "vpp": format_volt,
+    "vmax": format_volt,
+    "vmin": format_volt,
 }
 
 
