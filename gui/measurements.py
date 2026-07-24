@@ -8,8 +8,8 @@ MEASURE_GROUPS = [
         # ("fall", "Fall", "Fall Time"),
         ("duty_pos", "+Duty", "+ Duty Cycle"),
         ("duty_neg", "−Duty", "− Duty Cycle"),
-        # ("pw_pos", "+PW", "+ Pulse Width"),
-        # ("pw_neg", "−PW", "− Pulse Width"),
+        ("pw_pos", "+PW", "+ Pulse Width"),
+        ("pw_neg", "−PW", "− Pulse Width"),
     ]),
     ("vertical", "Vertical", [
         ("vmax", "Max", "Maximum"),
@@ -147,7 +147,7 @@ def _mean_period_samples(samples):
     return mean_period
 
 
-def _mean_duty_pos(samples):
+def _mean_pulse_widths_samples(samples):
     y = _finite_samples(samples)
     if y is None or y.size < 4:
         return None
@@ -160,7 +160,8 @@ def _mean_duty_pos(samples):
     if len(rises) < 2 or not falls:
         return None
     fi = 0
-    duties = []
+    high_ws = []
+    low_ws = []
     for ri in range(len(rises) - 1):
         r0 = rises[ri]
         r1 = rises[ri + 1]
@@ -172,10 +173,22 @@ def _mean_duty_pos(samples):
         if period <= 0:
             continue
         high_w = falls[fi] - r0
-        duties.append(100.0 * high_w / period)
-    if not duties:
+        high_ws.append(high_w)
+        low_ws.append(period - high_w)
+    if not high_ws:
         return None
-    return float(np.mean(duties))
+    return float(np.mean(high_ws)), float(np.mean(low_ws))
+
+
+def _mean_duty_pos(samples):
+    widths = _mean_pulse_widths_samples(samples)
+    if widths is None:
+        return None
+    high_w, low_w = widths
+    period = high_w + low_w
+    if period <= 0:
+        return None
+    return 100.0 * high_w / period
 
 
 def measure_frequency(samples, ns_per_sample):
@@ -205,6 +218,24 @@ def measure_duty_neg(samples, ns_per_sample):
     if d is None:
         return None
     return 100.0 - d
+
+
+def measure_pw_pos(samples, ns_per_sample):
+    if ns_per_sample is None or ns_per_sample <= 0:
+        return None
+    widths = _mean_pulse_widths_samples(samples)
+    if widths is None:
+        return None
+    return widths[0] * ns_per_sample
+
+
+def measure_pw_neg(samples, ns_per_sample):
+    if ns_per_sample is None or ns_per_sample <= 0:
+        return None
+    widths = _mean_pulse_widths_samples(samples)
+    if widths is None:
+        return None
+    return widths[1] * ns_per_sample
 
 
 def measure_vpp(samples, ns_per_sample):
@@ -247,6 +278,8 @@ _MEASURERS = {
     "period": measure_period,
     "duty_pos": measure_duty_pos,
     "duty_neg": measure_duty_neg,
+    "pw_pos": measure_pw_pos,
+    "pw_neg": measure_pw_neg,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
@@ -260,6 +293,8 @@ _FORMATTERS = {
     "period": format_time,
     "duty_pos": format_percent,
     "duty_neg": format_percent,
+    "pw_pos": format_time,
+    "pw_neg": format_time,
     "vpp": format_volt,
     "vmax": format_volt,
     "vmin": format_volt,
