@@ -17,9 +17,9 @@ MEASURE_GROUPS = [
         ("vpp", "PkPk", "Peak to Peak"),
         ("vtop", "Top", "Top"),
         ("vbase", "Base", "Base"),
-        # ("vmiddle", "Mid", "Middle"),
+        ("vmiddle", "Mid", "Middle"),
         ("vrms", "RMS", "RMS"),
-        # ("vamp", "Amp", "Amplitude"),
+        ("vamp", "Amp", "Amplitude"),
         ("vmean", "Mean", "Mean"),
         # ("vcycmean", "CMean", "Cycle Mean"),
         # ("vos_pos", "+OS", "Positive Overshoot"),
@@ -310,6 +310,13 @@ def measure_vbase(samples, ns_per_sample):
     return tb[0]
 
 
+def measure_vamp(samples, ns_per_sample):
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    return tb[1] - tb[0]
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
@@ -324,6 +331,7 @@ _MEASURERS = {
     "vrms": measure_vrms,
     "vtop": measure_vtop,
     "vbase": measure_vbase,
+    "vamp": measure_vamp,
 }
 
 
@@ -341,6 +349,7 @@ _FORMATTERS = {
     "vrms": format_volt,
     "vtop": format_volt,
     "vbase": format_volt,
+    "vamp": format_volt,
 }
 
 
