@@ -425,6 +425,34 @@ def measure_vcycmean(samples, ns_per_sample):
     return float(y[start:end].mean())
 
 
+def measure_vos_pos(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 2:
+        return None
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    base, top = tb
+    amp = top - base
+    if amp < 1e-6:
+        return None
+    return 100.0 * (float(y.max()) - top) / amp
+
+
+def measure_vos_neg(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 2:
+        return None
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    base, top = tb
+    amp = top - base
+    if amp < 1e-6:
+        return None
+    return 100.0 * (base - float(y.min())) / amp
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
@@ -435,6 +463,8 @@ _MEASURERS = {
     "rise": measure_rise,
     "fall": measure_fall,
     "vcycmean": measure_vcycmean,
+    "vos_pos": measure_vos_pos,
+    "vos_neg": measure_vos_neg,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
@@ -466,6 +496,8 @@ _FORMATTERS = {
     "vamp": format_volt,
     "vmiddle": format_volt,
     "vcycmean": format_volt,
+    "vos_pos": format_percent,
+    "vos_neg": format_percent,
 }
 
 
