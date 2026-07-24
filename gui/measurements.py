@@ -2,7 +2,7 @@ import numpy as np
 
 MEASURE_GROUPS = [
     ("horizontal", "Horizontal", [
-        # ("period", "Period", "Period"),
+        ("period", "Period", "Period"),
         ("freq", "Freq", "Frequency"),
         # ("rise", "Rise", "Rise Time"),
         # ("fall", "Fall", "Fall Time"),
@@ -65,6 +65,18 @@ def format_freq(hz):
     return f"{hz:.4g}Hz"
 
 
+def format_time(ns):
+    if ns is None or not np.isfinite(ns) or ns <= 0:
+        return "—"
+    if ns >= 1_000_000_000:
+        return f"{ns / 1_000_000_000:.4g}s"
+    if ns >= 1_000_000:
+        return f"{ns / 1_000_000:.4g}ms"
+    if ns >= 1_000:
+        return f"{ns / 1_000:.4g}µs"
+    return f"{ns:.4g}ns"
+
+
 def format_volt(v):
     if v is None or not np.isfinite(v):
         return "—"
@@ -74,9 +86,7 @@ def format_volt(v):
     return f"{v:.4g}V"
 
 
-def measure_frequency(samples, ns_per_sample):
-    if ns_per_sample is None or ns_per_sample <= 0:
-        return None
+def _mean_period_samples(samples):
     y = _finite_samples(samples)
     if y is None or y.size < 4:
         return None
@@ -104,7 +114,25 @@ def measure_frequency(samples, ns_per_sample):
     mean_period = float(periods.mean())
     if mean_period <= 0:
         return None
+    return mean_period
+
+
+def measure_frequency(samples, ns_per_sample):
+    if ns_per_sample is None or ns_per_sample <= 0:
+        return None
+    mean_period = _mean_period_samples(samples)
+    if mean_period is None:
+        return None
     return 1e9 / (mean_period * ns_per_sample)
+
+
+def measure_period(samples, ns_per_sample):
+    if ns_per_sample is None or ns_per_sample <= 0:
+        return None
+    mean_period = _mean_period_samples(samples)
+    if mean_period is None:
+        return None
+    return mean_period * ns_per_sample
 
 
 def measure_vpp(samples, ns_per_sample):
@@ -144,6 +172,7 @@ def measure_vrms(samples, ns_per_sample):
 
 _MEASURERS = {
     "freq": measure_frequency,
+    "period": measure_period,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
@@ -154,6 +183,7 @@ _MEASURERS = {
 
 _FORMATTERS = {
     "freq": format_freq,
+    "period": format_time,
     "vpp": format_volt,
     "vmax": format_volt,
     "vmin": format_volt,
