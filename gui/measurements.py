@@ -6,8 +6,8 @@ MEASURE_GROUPS = [
         ("freq", "Freq", "Frequency"),
         # ("rise", "Rise", "Rise Time"),
         # ("fall", "Fall", "Fall Time"),
-        # ("duty_pos", "+Duty", "+ Duty Cycle"),
-        # ("duty_neg", "−Duty", "− Duty Cycle"),
+        ("duty_pos", "+Duty", "+ Duty Cycle"),
+        ("duty_neg", "−Duty", "− Duty Cycle"),
         # ("pw_pos", "+PW", "+ Pulse Width"),
         # ("pw_neg", "−PW", "− Pulse Width"),
     ]),
@@ -86,10 +86,13 @@ def format_volt(v):
     return f"{v:.4g}V"
 
 
-def _mean_period_samples(samples):
-    y = _finite_samples(samples)
-    if y is None or y.size < 4:
-        return None
+def format_percent(p):
+    if p is None or not np.isfinite(p):
+        return "—"
+    return f"{p:.4g}%"
+
+
+def _hysteresis_levels(y):
     y_min = float(y.min())
     y_max = float(y.max())
     amp = y_max - y_min
@@ -97,8 +100,10 @@ def _mean_period_samples(samples):
         return None
     mid = 0.5 * (y_min + y_max)
     hyst = 0.1 * amp
-    low = mid - hyst
-    high = mid + hyst
+    return mid - hyst, mid + hyst
+
+
+def _rising_edges(y, low, high):
     edges = []
     armed = False
     for i, v in enumerate(y):
@@ -108,6 +113,31 @@ def _mean_period_samples(samples):
         elif v > high:
             edges.append(i)
             armed = False
+    return edges
+
+
+def _falling_edges(y, low, high):
+    edges = []
+    armed = False
+    for i, v in enumerate(y):
+        if not armed:
+            if v > high:
+                armed = True
+        elif v < low:
+            edges.append(i)
+            armed = False
+    return edges
+
+
+def _mean_period_samples(samples):
+    y = _finite_samples(samples)
+    if y is None or y.size < 4:
+        return None
+    levels = _hysteresis_levels(y)
+    if levels is None:
+        return None
+    low, high = levels
+    edges = _rising_edges(y, low, high)
     if len(edges) < 2:
         return None
     periods = np.diff(np.asarray(edges, dtype=np.float64))
@@ -115,6 +145,37 @@ def _mean_period_samples(samples):
     if mean_period <= 0:
         return None
     return mean_period
+
+
+def _mean_duty_pos(samples):
+    y = _finite_samples(samples)
+    if y is None or y.size < 4:
+        return None
+    levels = _hysteresis_levels(y)
+    if levels is None:
+        return None
+    low, high = levels
+    rises = _rising_edges(y, low, high)
+    falls = _falling_edges(y, low, high)
+    if len(rises) < 2 or not falls:
+        return None
+    fi = 0
+    duties = []
+    for ri in range(len(rises) - 1):
+        r0 = rises[ri]
+        r1 = rises[ri + 1]
+        while fi < len(falls) and falls[fi] <= r0:
+            fi += 1
+        if fi >= len(falls) or falls[fi] >= r1:
+            continue
+        period = r1 - r0
+        if period <= 0:
+            continue
+        high_w = falls[fi] - r0
+        duties.append(100.0 * high_w / period)
+    if not duties:
+        return None
+    return float(np.mean(duties))
 
 
 def measure_frequency(samples, ns_per_sample):
@@ -133,6 +194,17 @@ def measure_period(samples, ns_per_sample):
     if mean_period is None:
         return None
     return mean_period * ns_per_sample
+
+
+def measure_duty_pos(samples, ns_per_sample):
+    return _mean_duty_pos(samples)
+
+
+def measure_duty_neg(samples, ns_per_sample):
+    d = _mean_duty_pos(samples)
+    if d is None:
+        return None
+    return 100.0 - d
 
 
 def measure_vpp(samples, ns_per_sample):
@@ -173,6 +245,8 @@ def measure_vrms(samples, ns_per_sample):
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
+    "duty_pos": measure_duty_pos,
+    "duty_neg": measure_duty_neg,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
@@ -184,6 +258,8 @@ _MEASURERS = {
 _FORMATTERS = {
     "freq": format_freq,
     "period": format_time,
+    "duty_pos": format_percent,
+    "duty_neg": format_percent,
     "vpp": format_volt,
     "vmax": format_volt,
     "vmin": format_volt,
