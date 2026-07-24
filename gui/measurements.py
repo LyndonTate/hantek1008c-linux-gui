@@ -15,8 +15,8 @@ MEASURE_GROUPS = [
         ("vmax", "Max", "Maximum"),
         ("vmin", "Min", "Minimum"),
         ("vpp", "PkPk", "Peak to Peak"),
-        # ("vtop", "Top", "Top"),
-        # ("vbase", "Base", "Base"),
+        ("vtop", "Top", "Top"),
+        ("vbase", "Base", "Base"),
         # ("vmiddle", "Mid", "Middle"),
         ("vrms", "RMS", "RMS"),
         # ("vamp", "Amp", "Amplitude"),
@@ -273,6 +273,43 @@ def measure_vrms(samples, ns_per_sample):
     return float(np.sqrt(np.mean(y * y)))
 
 
+def _top_base(samples):
+    y = _finite_samples(samples)
+    if y is None or y.size < 2:
+        return None
+    y_min = float(y.min())
+    y_max = float(y.max())
+    if y_max - y_min < 1e-6:
+        return y_min, y_max
+    n_bins = int(min(256, max(32, y.size // 16)))
+    counts, edges = np.histogram(y, bins=n_bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    mid = 0.5 * (y_min + y_max)
+    low_idx = np.where(centers <= mid)[0]
+    high_idx = np.where(centers > mid)[0]
+    if low_idx.size == 0 or high_idx.size == 0:
+        return y_min, y_max
+    base = float(centers[low_idx[np.argmax(counts[low_idx])]])
+    top = float(centers[high_idx[np.argmax(counts[high_idx])]])
+    if top < base:
+        base, top = top, base
+    return base, top
+
+
+def measure_vtop(samples, ns_per_sample):
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    return tb[1]
+
+
+def measure_vbase(samples, ns_per_sample):
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    return tb[0]
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
@@ -285,6 +322,8 @@ _MEASURERS = {
     "vmin": measure_vmin,
     "vmean": measure_vmean,
     "vrms": measure_vrms,
+    "vtop": measure_vtop,
+    "vbase": measure_vbase,
 }
 
 
@@ -300,6 +339,8 @@ _FORMATTERS = {
     "vmin": format_volt,
     "vmean": format_volt,
     "vrms": format_volt,
+    "vtop": format_volt,
+    "vbase": format_volt,
 }
 
 
