@@ -317,6 +317,13 @@ def measure_vamp(samples, ns_per_sample):
     return tb[1] - tb[0]
 
 
+def measure_vmiddle(samples, ns_per_sample):
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    return 0.5 * (tb[0] + tb[1])
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
@@ -332,6 +339,7 @@ _MEASURERS = {
     "vtop": measure_vtop,
     "vbase": measure_vbase,
     "vamp": measure_vamp,
+    "vmiddle": measure_vmiddle,
 }
 
 
@@ -350,6 +358,7 @@ _FORMATTERS = {
     "vtop": format_volt,
     "vbase": format_volt,
     "vamp": format_volt,
+    "vmiddle": format_volt,
 }
 
 
