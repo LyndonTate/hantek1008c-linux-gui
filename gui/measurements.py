@@ -20,7 +20,7 @@ MEASURE_GROUPS = [
         # ("vmiddle", "Mid", "Middle"),
         # ("vrms", "RMS", "RMS"),
         # ("vamp", "Amp", "Amplitude"),
-        # ("vmean", "Mean", "Mean"),
+        ("vmean", "Mean", "Mean"),
         # ("vcycmean", "CMean", "Cycle Mean"),
         # ("vos_pos", "+OS", "Positive Overshoot"),
         # ("vos_neg", "−OS", "Negative Overshoot"),
@@ -128,11 +128,19 @@ def measure_vmin(samples, ns_per_sample):
     return float(y.min())
 
 
+def measure_vmean(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 1:
+        return None
+    return float(y.mean())
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
+    "vmean": measure_vmean,
 }
 
 
@@ -141,6 +149,7 @@ _FORMATTERS = {
     "vpp": format_volt,
     "vmax": format_volt,
     "vmin": format_volt,
+    "vmean": format_volt,
 }
 
 
