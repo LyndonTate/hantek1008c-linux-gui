@@ -899,10 +899,7 @@ class Hantek1008Raw:
         assert sampling_rate in Hantek1008Raw.__roll_mode_sampling_rate_to_id_dic, \
             f"sample_rate must be in {Hantek1008Raw.__roll_mode_sampling_rate_to_id_dic.keys()}"
 
-        # Interleaved row width in bytes: every active channel plus the extra
-        # 9th "mystic" channel, two bytes per sample. The c9/ca byte counts are
-        # NOT row-aligned, so we accumulate raw bytes and only convert whole rows.
-        row_bytes = (len(self.__active_channels) + 1) * 2
+        row_bytes = len(self.__active_channels) * 2
 
         try:
             self.__arm_roll_mode(sampling_rate)
@@ -929,7 +926,6 @@ class Hantek1008Raw:
 
                 self.__send_ping()
 
-                # Slice complete interleaved rows; carry any partial row over.
                 pending += sample_response
                 whole = len(pending) - (len(pending) % row_bytes)
                 if whole == 0:
@@ -937,11 +933,7 @@ class Hantek1008Raw:
                 chunk, pending = pending[:whole], pending[whole:]
 
                 sample_shorts = Hantek1008Raw.__from_bytes_to_shorts(chunk)
-                # In rolling mode there is an additional 9th channel (values
-                # around 1742); it is interleaved with the active channels and
-                # dropped here before the data reaches the caller.
-                per_channel_data = self.__to_per_channel_lists(sample_shorts, self.__active_channels,
-                                                               expect_ninth_channel=True)
+                per_channel_data = self.__to_per_channel_lists(sample_shorts, self.__active_channels)
                 yield per_channel_data
         except GeneratorExit:
             # TODO: auto start pause tread?
