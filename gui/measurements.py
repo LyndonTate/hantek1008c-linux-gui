@@ -4,8 +4,8 @@ MEASURE_GROUPS = [
     ("horizontal", "Horizontal", [
         ("period", "Period", "Period"),
         ("freq", "Freq", "Frequency"),
-        # ("rise", "Rise", "Rise Time"),
-        # ("fall", "Fall", "Fall Time"),
+        ("rise", "Rise", "Rise Time"),
+        ("fall", "Fall", "Fall Time"),
         ("duty_pos", "+Duty", "+ Duty Cycle"),
         ("duty_neg", "−Duty", "− Duty Cycle"),
         ("pw_pos", "+PW", "+ Pulse Width"),
@@ -324,6 +324,89 @@ def measure_vmiddle(samples, ns_per_sample):
     return 0.5 * (tb[0] + tb[1])
 
 
+def _interp_cross(y0, y1, level):
+    dy = y1 - y0
+    if dy == 0:
+        return 0.0
+    return (level - y0) / dy
+
+
+def _edge_times_10_90(samples, rising):
+    y = _finite_samples(samples)
+    if y is None or y.size < 4:
+        return None
+    tb = _top_base(samples)
+    if tb is None:
+        return None
+    base, top = tb
+    amp = top - base
+    if amp < 1e-6:
+        return None
+    lo = base + 0.1 * amp
+    hi = base + 0.9 * amp
+    n = y.size
+    times = []
+    i = 0
+    while i < n - 1:
+        t_first = None
+        while i < n - 1:
+            a, b = y[i], y[i + 1]
+            if rising:
+                if a <= lo < b or (a < lo and b >= lo):
+                    t_first = i + _interp_cross(a, b, lo)
+                    i += 1
+                    break
+            else:
+                if a >= hi > b or (a > hi and b <= hi):
+                    t_first = i + _interp_cross(a, b, hi)
+                    i += 1
+                    break
+            i += 1
+        if t_first is None:
+            break
+        t_second = None
+        j = int(t_first)
+        while j < n - 1:
+            a, b = y[j], y[j + 1]
+            if rising:
+                if a <= hi < b or (a < hi and b >= hi):
+                    t_second = j + _interp_cross(a, b, hi)
+                    break
+                if b < lo:
+                    break
+            else:
+                if a >= lo > b or (a > lo and b <= lo):
+                    t_second = j + _interp_cross(a, b, lo)
+                    break
+                if b > hi:
+                    break
+            j += 1
+        if t_second is not None and t_second > t_first:
+            times.append(t_second - t_first)
+            i = j + 1
+    if not times:
+        return None
+    return float(np.mean(times))
+
+
+def measure_rise(samples, ns_per_sample):
+    if ns_per_sample is None or ns_per_sample <= 0:
+        return None
+    dt = _edge_times_10_90(samples, True)
+    if dt is None:
+        return None
+    return dt * ns_per_sample
+
+
+def measure_fall(samples, ns_per_sample):
+    if ns_per_sample is None or ns_per_sample <= 0:
+        return None
+    dt = _edge_times_10_90(samples, False)
+    if dt is None:
+        return None
+    return dt * ns_per_sample
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
@@ -331,6 +414,8 @@ _MEASURERS = {
     "duty_neg": measure_duty_neg,
     "pw_pos": measure_pw_pos,
     "pw_neg": measure_pw_neg,
+    "rise": measure_rise,
+    "fall": measure_fall,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
@@ -350,6 +435,8 @@ _FORMATTERS = {
     "duty_neg": format_percent,
     "pw_pos": format_time,
     "pw_neg": format_time,
+    "rise": format_time,
+    "fall": format_time,
     "vpp": format_volt,
     "vmax": format_volt,
     "vmin": format_volt,
