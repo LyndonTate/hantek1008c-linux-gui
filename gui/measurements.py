@@ -18,7 +18,7 @@ MEASURE_GROUPS = [
         # ("vtop", "Top", "Top"),
         # ("vbase", "Base", "Base"),
         # ("vmiddle", "Mid", "Middle"),
-        # ("vrms", "RMS", "RMS"),
+        ("vrms", "RMS", "RMS"),
         # ("vamp", "Amp", "Amplitude"),
         ("vmean", "Mean", "Mean"),
         # ("vcycmean", "CMean", "Cycle Mean"),
@@ -135,12 +135,20 @@ def measure_vmean(samples, ns_per_sample):
     return float(y.mean())
 
 
+def measure_vrms(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 1:
+        return None
+    return float(np.sqrt(np.mean(y * y)))
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
     "vmean": measure_vmean,
+    "vrms": measure_vrms,
 }
 
 
@@ -150,6 +158,7 @@ _FORMATTERS = {
     "vmax": format_volt,
     "vmin": format_volt,
     "vmean": format_volt,
+    "vrms": format_volt,
 }
 
 
