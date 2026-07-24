@@ -1,5 +1,10 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
+    QScrollArea, QFrame,
+)
+from PyQt6.QtCore import pyqtSignal, Qt
+
+from gui.measurements import MEASURE_TYPES, MEASURE_GROUPS
 
 NS_PER_DIV_VALUES = [
     1, 2, 5, 10, 20, 50, 100, 200, 500,
@@ -87,6 +92,25 @@ def _mode_btn_style(is_selected):
             "padding: 3px 6px; font-size: 11px;")
 
 
+def _auto_type_style(any_on):
+    if any_on:
+        return ("background-color: #2a2a2a; color: #dddddd; border: 1px solid #888888; "
+                "padding: 1px 4px; font-size: 10px; font-weight: bold;")
+    return ("background-color: #2a2a2a; color: #888888; border: 1px solid #444444; "
+            "padding: 1px 4px; font-size: 10px;")
+
+
+def _auto_dot_style(color, is_on, ch_active):
+    if not ch_active:
+        return ("background-color: #151515; color: #2a2a2a; border: 1px solid #222222; "
+                "border-radius: 2px; padding: 0px; font-size: 10px;")
+    if is_on:
+        return (f"background-color: {color}; color: #000000; border: none; "
+                "border-radius: 2px; padding: 0px; font-size: 10px; font-weight: bold;")
+    return ("background-color: #2a2a2a; color: #666666; border: 1px solid #444444; "
+            "border-radius: 2px; padding: 0px; font-size: 10px;")
+
+
 class ControlsPanel(QWidget):
     time_div_changed = pyqtSignal(int)       # ns_per_div
     channel_toggled = pyqtSignal(int, bool)  # ch_idx, is_on
@@ -95,6 +119,7 @@ class ControlsPanel(QWidget):
     trigger_slope_changed = pyqtSignal(str)  # "rising" | "falling"
     acq_mode_changed = pyqtSignal(str)       # "auto" | "normal" | "single"
     cursor_toggled = pyqtSignal(bool)        # measurement cursor on/off
+    auto_measure_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,6 +134,7 @@ class ControlsPanel(QWidget):
         # matches); "normal" holds the display until a matching edge arrives.
         self._acq_mode = "auto"
         self._cursor_on = False
+        self._auto_on = {(ch, mid): False for ch in range(8) for mid, _, _ in MEASURE_TYPES}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 8)
@@ -191,6 +217,37 @@ class ControlsPanel(QWidget):
         layout.addWidget(self._cursor_btn)
         self._update_cursor_btn_style()
 
+        lbl_auto = QLabel("Auto")
+        lbl_auto.setStyleSheet("color: #666666; font-size: 10px; margin-top: 4px;")
+        lbl_auto.setToolTip(
+            "One row per measure. Dots = channels (click one, or the label for all active). "
+            "Live values show on the plot overlay."
+        )
+        layout.addWidget(lbl_auto)
+
+        self._auto_list_host = QWidget()
+        self._auto_list_host.setStyleSheet("background-color: transparent;")
+        self._auto_list = QVBoxLayout(self._auto_list_host)
+        self._auto_list.setContentsMargins(0, 0, 0, 0)
+        self._auto_list.setSpacing(2)
+        self._auto_type_btns = {}
+        self._auto_dot_btns = {}
+        self._build_auto_list()
+        auto_scroll = QScrollArea()
+        auto_scroll.setWidgetResizable(True)
+        auto_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        auto_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        auto_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        auto_scroll.setMinimumHeight(180)
+        auto_scroll.setMaximumHeight(260)
+        auto_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { width: 6px; background: #1a1a1a; }"
+            "QScrollBar::handle:vertical { background: #444444; border-radius: 3px; }"
+        )
+        auto_scroll.setWidget(self._auto_list_host)
+        layout.addWidget(auto_scroll)
+
         sep2 = QLabel()
         sep2.setFixedHeight(1)
         sep2.setStyleSheet("background-color: #333333; margin-top: 4px; margin-bottom: 2px;")
@@ -209,6 +266,7 @@ class ControlsPanel(QWidget):
 
         layout.addStretch()
         self._update_trig_btn_styles()
+        self._refresh_auto_list()
 
     def _make_channel_row(self, ch_idx):
         color = CHANNEL_COLORS[ch_idx]
@@ -251,6 +309,83 @@ class ControlsPanel(QWidget):
 
         return widget
 
+    def _build_auto_list(self):
+        for _gid, group_label, items in MEASURE_GROUPS:
+            hdr = QLabel(group_label)
+            hdr.setStyleSheet(
+                "color: #666666; font-size: 9px; font-weight: bold; "
+                "margin-top: 4px; margin-bottom: 1px;"
+            )
+            self._auto_list.addWidget(hdr)
+            for mid, short, full in items:
+                row_w = QWidget()
+                row_w.setStyleSheet("background-color: transparent;")
+                row = QHBoxLayout(row_w)
+                row.setContentsMargins(0, 0, 0, 0)
+                row.setSpacing(2)
+
+                type_btn = QPushButton(short)
+                type_btn.setFixedWidth(44)
+                type_btn.setFixedHeight(18)
+                type_btn.setToolTip(f"{full} — toggle for all active channels")
+                type_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                type_btn.clicked.connect(lambda _, m=mid: self._on_auto_type(m))
+                row.addWidget(type_btn)
+                self._auto_type_btns[mid] = type_btn
+
+                for ch in range(8):
+                    dot = QPushButton(str(ch + 1))
+                    dot.setFixedSize(18, 18)
+                    dot.setToolTip(f"CH{ch + 1} {full}")
+                    dot.setCursor(Qt.CursorShape.PointingHandCursor)
+                    dot.clicked.connect(lambda _, c=ch, m=mid: self._on_auto_dot(c, m))
+                    row.addWidget(dot)
+                    self._auto_dot_btns[(ch, mid)] = dot
+
+                row.addStretch()
+                self._auto_list.addWidget(row_w)
+        self._auto_list.addStretch()
+
+    def _on_auto_dot(self, ch, mid):
+        if not self._active[ch]:
+            return
+        key = (ch, mid)
+        self._auto_on[key] = not self._auto_on[key]
+        self._refresh_auto_list()
+        self.auto_measure_changed.emit()
+
+    def _on_auto_type(self, mid):
+        active = [ch for ch in range(8) if self._active[ch]]
+        if not active:
+            return
+        all_on = all(self._auto_on[(ch, mid)] for ch in active)
+        new_state = not all_on
+        for ch in active:
+            self._auto_on[(ch, mid)] = new_state
+        self._refresh_auto_list()
+        self.auto_measure_changed.emit()
+
+    def _refresh_auto_list(self):
+        for mid, _, _ in MEASURE_TYPES:
+            active = [ch for ch in range(8) if self._active[ch]]
+            any_on = any(self._auto_on[(ch, mid)] for ch in active) if active else False
+            self._auto_type_btns[mid].setStyleSheet(_auto_type_style(any_on))
+            for ch in range(8):
+                ch_active = self._active[ch]
+                is_on = self._auto_on[(ch, mid)] and ch_active
+                dot = self._auto_dot_btns[(ch, mid)]
+                dot.setEnabled(ch_active)
+                dot.setStyleSheet(_auto_dot_style(CHANNEL_COLORS[ch], is_on, ch_active))
+
+    def get_auto_measure_selection(self):
+        return {
+            (ch, mid)
+            for ch in range(8)
+            if self._active[ch]
+            for mid, _, _ in MEASURE_TYPES
+            if self._auto_on[(ch, mid)]
+        }
+
     def _on_time_div(self, _):
         self.time_div_changed.emit(self._time_combo.currentData())
 
@@ -276,7 +411,12 @@ class ControlsPanel(QWidget):
             self._set_trigger_channel(first_active)
         else:
             self._update_trig_btn_styles()
+        if not new_state:
+            for mid, _, _ in MEASURE_TYPES:
+                self._auto_on[(ch_idx, mid)] = False
+        self._refresh_auto_list()
         self.channel_toggled.emit(ch_idx, new_state)
+        self.auto_measure_changed.emit()
 
     def _on_trigger(self, ch_idx):
         if not self._active[ch_idx]:

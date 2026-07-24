@@ -12,6 +12,7 @@ from gui.controls import ControlsPanel, CHANNEL_COLORS
 from gui.acquisition import AcquisitionThread
 from gui.channel_margin import ChannelMarginWidget
 from gui.cursor_overlay import CursorOverlay
+from gui.measurements import MEASURE_TYPES, measure_value, format_measure
 from vendor.hantek1008 import Hantek1008
 
 TIME_DIVS = 10
@@ -187,6 +188,7 @@ class ScopeWindow(QMainWindow):
         self._roll_mode = False
         self._roll_buf = {}              # {ch_id: np.ndarray} ring buffer of volts
         self._roll_head = 0              # next write index into the ring buffers
+        self._ns_per_sample = 0.0
 
         self._setup_ui()
         self._start_acquisition()
@@ -234,6 +236,15 @@ class ScopeWindow(QMainWindow):
 
         self._cursor_overlay = CursorOverlay(self._plot_widget)
 
+        self._measure_readout = pg.TextItem(
+            anchor=(0, 0), color="#ffffff",
+            fill=pg.mkBrush(0, 0, 0, 180),
+            border=pg.mkPen("#444444", width=1),
+        )
+        self._measure_readout.setZValue(180)
+        self._measure_readout.setVisible(False)
+        self._plot_widget.addItem(self._measure_readout, ignoreBounds=True)
+
         self._controls.time_div_changed.connect(self._on_time_div_changed)
         self._controls.channel_toggled.connect(self._on_channel_toggled)
         self._controls.vscale_changed.connect(self._on_vscale_changed)
@@ -241,6 +252,7 @@ class ScopeWindow(QMainWindow):
         self._controls.trigger_slope_changed.connect(self._on_trigger_slope_changed)
         self._controls.acq_mode_changed.connect(self._on_acq_mode_changed)
         self._controls.cursor_toggled.connect(self._on_cursor_toggled)
+        self._controls.auto_measure_changed.connect(self._on_auto_measure_changed)
 
         # The trigger markers are always active — the hardware trigger is always
         # armed. In auto mode the device free-runs when no edge matches.
@@ -442,8 +454,9 @@ class ScopeWindow(QMainWindow):
         old_display_samples = self._display_samples
         self._display_samples, samples_per_div = self._compute_display_geometry(frame_size, ns_per_div)
         self._samples_per_div = samples_per_div
+        self._ns_per_sample = ns_per_div / samples_per_div if samples_per_div else 0.0
         self._time_axis.set_timebase(ns_per_div, samples_per_div)
-        self._cursor_overlay.set_timebase(ns_per_div / samples_per_div if samples_per_div else 0.0)
+        self._cursor_overlay.set_timebase(self._ns_per_sample)
         log.info("_init_buffer: ns/div=%d frame_size=%d -> display_samples=%d samples_per_div=%.2f (was display=%d)",
                  ns_per_div, frame_size, self._display_samples, samples_per_div, old_display_samples)
         is_first_init = self._frame_size == 0
@@ -603,6 +616,7 @@ class ScopeWindow(QMainWindow):
             for ch_id, samples_list in data.items()
         }
         self._redraw()
+        self._update_auto_measures()
 
         if mode == "single" and triggered:
             # Real trigger caught — freeze on this frame and deselect all modes.
@@ -615,9 +629,10 @@ class ScopeWindow(QMainWindow):
         ns_per_div = self._controls.get_ns_per_div()
         self._display_samples, samples_per_div = self._compute_display_geometry(0, ns_per_div)
         self._samples_per_div = samples_per_div
+        self._ns_per_sample = ns_per_div / samples_per_div if samples_per_div else 0.0
         self._frame_size = self._display_samples
         self._time_axis.set_timebase(ns_per_div, samples_per_div)
-        self._cursor_overlay.set_timebase(ns_per_div / samples_per_div if samples_per_div else 0.0)
+        self._cursor_overlay.set_timebase(self._ns_per_sample)
         log.info("_init_roll_display: ns/div=%d -> display_samples=%d samples_per_div=%.2f",
                  ns_per_div, self._display_samples, samples_per_div)
 
@@ -699,6 +714,7 @@ class ScopeWindow(QMainWindow):
             buf[gap] = np.nan
 
         self._redraw_roll()
+        self._update_auto_measures()
 
     def _redraw_roll(self):
         for ch, buf in self._roll_buf.items():
@@ -746,6 +762,73 @@ class ScopeWindow(QMainWindow):
 
     def _on_cursor_toggled(self, enabled):
         self._cursor_overlay.set_enabled(enabled)
+
+    def _on_auto_measure_changed(self):
+        self._update_auto_measures()
+
+    def _channel_samples_for_measure(self, ch):
+        if self._roll_mode:
+            buf = self._roll_buf.get(ch)
+            if buf is None:
+                return None
+            head = self._roll_head
+            ordered = np.concatenate((buf[head:], buf[:head]))
+            return ordered
+        return self._last_frame_np.get(ch)
+
+    def _update_auto_measures(self):
+        selection = self._controls.get_auto_measure_selection()
+        values = {}
+        if selection and self._ns_per_sample > 0:
+            for ch, mid in selection:
+                samples = self._channel_samples_for_measure(ch)
+                if samples is None:
+                    values[(ch, mid)] = None
+                else:
+                    values[(ch, mid)] = measure_value(mid, samples, self._ns_per_sample)
+        self._update_measure_readout(values)
+
+    def _update_measure_readout(self, values):
+        if not values:
+            self._measure_readout.setVisible(False)
+            return
+        lines = []
+        mid_labels = {mid: short for mid, short, _ in MEASURE_TYPES}
+        for ch in range(8):
+            parts = []
+            for mid, short, _ in MEASURE_TYPES:
+                key = (ch, mid)
+                if key not in values:
+                    continue
+                text = format_measure(mid, values[key])
+                parts.append(f"{short} {text}")
+            if parts:
+                color = CHANNEL_COLORS[ch]
+                lines.append(
+                    f"<span style='color:{color};'>CH{ch + 1}</span> "
+                    f"<span style='color:#dddddd;'>{' · '.join(parts)}</span>"
+                )
+        if not lines:
+            self._measure_readout.setVisible(False)
+            return
+        html = (
+            "<div style='font-size:11px; font-family:monospace; padding:3px 5px; "
+            "line-height:1.35;'>"
+            + "<br>".join(lines)
+            + "</div>"
+        )
+        self._measure_readout.setHtml(html)
+        self._position_measure_readout()
+        self._measure_readout.setVisible(True)
+
+    def _position_measure_readout(self):
+        vb = self._plot_widget.getPlotItem().getViewBox()
+        bounds = vb.viewRange()
+        x0 = bounds[0][0]
+        y1 = bounds[1][1]
+        x_pad = (bounds[0][1] - bounds[0][0]) * 0.01
+        y_pad = (bounds[1][1] - bounds[1][0]) * 0.02
+        self._measure_readout.setPos(x0 + x_pad, y1 - y_pad)
 
     def _on_device_ready(self, zero_offsets):
         self._zero_offsets = zero_offsets
