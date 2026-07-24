@@ -21,9 +21,9 @@ MEASURE_GROUPS = [
         ("vrms", "RMS", "RMS"),
         ("vamp", "Amp", "Amplitude"),
         ("vmean", "Mean", "Mean"),
-        # ("vcycmean", "CMean", "Cycle Mean"),
-        # ("vos_pos", "+OS", "Positive Overshoot"),
-        # ("vos_neg", "−OS", "Negative Overshoot"),
+        ("vcycmean", "CMean", "Cycle Mean"),
+        ("vos_pos", "+OS", "Positive Overshoot"),
+        ("vos_neg", "−OS", "Negative Overshoot"),
     ]),
 ]
 
@@ -407,6 +407,24 @@ def measure_fall(samples, ns_per_sample):
     return dt * ns_per_sample
 
 
+def measure_vcycmean(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 4:
+        return None
+    levels = _hysteresis_levels(y)
+    if levels is None:
+        return None
+    low, high = levels
+    edges = _rising_edges(y, low, high)
+    if len(edges) < 2:
+        return None
+    start = edges[0]
+    end = edges[-1]
+    if end <= start:
+        return None
+    return float(y[start:end].mean())
+
+
 _MEASURERS = {
     "freq": measure_frequency,
     "period": measure_period,
@@ -416,6 +434,7 @@ _MEASURERS = {
     "pw_neg": measure_pw_neg,
     "rise": measure_rise,
     "fall": measure_fall,
+    "vcycmean": measure_vcycmean,
     "vpp": measure_vpp,
     "vmax": measure_vmax,
     "vmin": measure_vmin,
@@ -446,6 +465,7 @@ _FORMATTERS = {
     "vbase": format_volt,
     "vamp": format_volt,
     "vmiddle": format_volt,
+    "vcycmean": format_volt,
 }
 
 
