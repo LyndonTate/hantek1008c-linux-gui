@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hantek 1008C Linux GUI</title>
+  <meta name="description" content="Open-source Linux GUI for the Hantek 1008C USB oscilloscope. 8 channels, trigger, roll mode, and session recording. No Windows vendor software required.">
+  <link rel="canonical" href="https://lyndontate.github.io/hantek1008c-linux-gui/">
+  <meta property="og:title" content="Hantek 1008C Linux GUI">
+  <meta property="og:description" content="Open-source oscilloscope UI for the Hantek 1008C on Linux. No Windows vendor software required.">
+  <meta property="og:image" content="https://lyndontate.github.io/hantek1008c-linux-gui/scope.png">
+  <meta property="og:image:alt" content="Hanscope Linux GUI for the Hantek 1008C, two channels live">
+  <meta name="twitter:card" content="summary_large_image">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0a0a0a;
+      color: #dddddd;
+      font: 16px/1.5 system-ui, sans-serif;
+      max-width: 720px;
+      margin-inline: auto;
+      padding: 48px 20px;
+    }
+    h1 {
+      font-size: 1.6rem;
+      font-weight: 650;
+      color: #ffffff;
+      margin: 0 0 12px;
+    }
+    p { margin: 0 0 16px; }
+    a { color: #ff9900; }
+    img.shot {
+      display: block;
+      width: 100%;
+      height: auto;
+      border: 1px solid #333;
+      background: #000;
+      margin: 24px 0;
+    }
+    .repo {
+      display: inline-block;
+      background: #ff9900;
+      color: #000;
+      font-weight: 650;
+      text-decoration: none;
+      padding: 8px 14px;
+      margin: 8px 0 24px;
+    }
+    code {
+      font-size: 0.9em;
+      background: #1a1a1a;
+      padding: 1px 5px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Hantek 1008C Linux GUI</h1>
+  <p>
+    An open-source oscilloscope UI for the <strong>Hantek 1008C</strong> USB scope on Linux.
+    The vendor software is Windows-only.
+  </p>
+  <p>
+    <a class="repo" href="https://github.com/LyndonTate/hantek1008c-linux-gui">GitHub repository</a>
+  </p>
+  <img class="shot" src="scope.png" alt="Hanscope, a Hantek 1008C Linux GUI: CH1 1 kHz square wave and CH2 DC, live measurements, Record and Open controls">
+  <p>
+    8 channels, per-channel V/div, hardware trigger (auto / normal / single, rising or falling),
+    roll mode, measurements, and <code>.hsrec</code> session recording with optional mic voice notes.
+  </p>
+  <p>
+    Python ≥ 3.10. Clone the repo, <code>pip install -r requirements.txt</code>, run <code>python3 main.py</code>.
+    A udev rule is required so the USB device is usable without root — see the
+    <a href="https://github.com/LyndonTate/hantek1008c-linux-gui">README</a>.
+  </p>
+</body>
+</html>
