@@ -8,6 +8,12 @@ import bisect
 import numpy as np
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+try:
+    from PyQt6.QtMultimedia import QAudioSource, QAudioSink, QAudioFormat, QMediaDevices
+    HAS_AUDIO = True
+except ImportError:
+    HAS_AUDIO = False
+
 MAGIC = b"HSREC001"
 INDEX_MAGIC = b"HSIDX001"
 VERSION = 1
@@ -15,6 +21,11 @@ HEADER_SIZE = 64
 EV_CONFIG = 1
 EV_FRAME = 2
 EV_ROLL = 3
+EV_AUDIO = 4
+_KNOWN = (EV_CONFIG, EV_FRAME, EV_ROLL, EV_AUDIO)
+AUDIO_RATE = 16000
+AUDIO_CHANNELS = 1
+_AUDIO_HDR = struct.Struct("<IBBH")
 
 _EVENT_HDR = struct.Struct("<IBBHQ")
 _KF = struct.Struct("<QQII")
@@ -66,6 +77,152 @@ def _unpack_channels(payload):
     return data, triggered
 
 
+def _pack_audio(pcm, rate, channels):
+    return _AUDIO_HDR.pack(int(rate), int(channels), 1, 0) + pcm
+
+
+def _unpack_audio(payload):
+    rate, channels, _fmt, _res = _AUDIO_HDR.unpack_from(payload, 0)
+    return payload[_AUDIO_HDR.size:], int(rate), int(channels)
+
+
+def _audio_format():
+    fmt = QAudioFormat()
+    fmt.setSampleRate(AUDIO_RATE)
+    fmt.setChannelCount(AUDIO_CHANNELS)
+    fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+    return fmt
+
+
+class MicRecorder(QObject):
+    def __init__(self, recorder, parent=None):
+        super().__init__(parent)
+        self._rec = recorder
+        self._src = None
+        self._io = None
+        self._buf = bytearray()
+        self._rate = AUDIO_RATE
+        self._channels = AUDIO_CHANNELS
+        self._chunk = AUDIO_RATE * 2 * AUDIO_CHANNELS // 10
+        self._muted = True
+
+    def set_muted(self, on):
+        self._muted = bool(on)
+        if self._muted:
+            self._buf.clear()
+
+    def start(self):
+        if not HAS_AUDIO:
+            return False
+        dev = QMediaDevices.defaultAudioInput()
+        if dev.isNull():
+            return False
+        fmt = _audio_format()
+        self._src = QAudioSource(dev, fmt, self)
+        self._io = self._src.start()
+        if self._io is None:
+            self._src = None
+            return False
+        actual = self._src.format()
+        self._rate = actual.sampleRate() or AUDIO_RATE
+        self._channels = actual.channelCount() or AUDIO_CHANNELS
+        bytes_ps = max(1, self._rate * self._channels * 2)
+        self._chunk = max(bytes_ps // 10, 320)
+        self._io.readyRead.connect(self._on_ready)
+        return True
+
+    def _on_ready(self):
+        if self._io is None:
+            return
+        data = bytes(self._io.readAll())
+        if self._muted:
+            self._buf.clear()
+            return
+        self._buf.extend(data)
+        while len(self._buf) >= self._chunk:
+            piece = bytes(self._buf[:self._chunk])
+            del self._buf[:self._chunk]
+            self._rec.write_audio(piece, self._rate, self._channels)
+
+    def stop(self):
+        if self._buf and self._rec is not None and not self._muted:
+            self._rec.write_audio(bytes(self._buf), self._rate, self._channels)
+        self._buf.clear()
+        if self._src is not None:
+            self._src.stop()
+            self._src = None
+            self._io = None
+
+
+class AudioPlayer(QObject):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._sink = None
+        self._io = None
+        self._rate = AUDIO_RATE
+        self._channels = AUDIO_CHANNELS
+        self._playing = True
+
+    def _ensure(self, rate, channels):
+        if not HAS_AUDIO:
+            return False
+        if (self._sink is not None and self._io is not None
+                and self._rate == rate and self._channels == channels):
+            return True
+        self.stop()
+        dev = QMediaDevices.defaultAudioOutput()
+        if dev.isNull():
+            return False
+        fmt = QAudioFormat()
+        fmt.setSampleRate(rate)
+        fmt.setChannelCount(channels)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        self._sink = QAudioSink(dev, fmt, self)
+        self._sink.setBufferSize(rate * channels * 2)
+        self._io = self._sink.start()
+        if self._io is None:
+            self._sink = None
+            return False
+        self._rate = rate
+        self._channels = channels
+        if not self._playing:
+            self._sink.suspend()
+        return True
+
+    def write(self, pcm, rate, channels):
+        if not self._playing:
+            return
+        if not self._ensure(rate, channels):
+            return
+        self._io.write(pcm)
+
+    def reset(self):
+        if self._sink is None:
+            return
+        rate, channels = self._rate, self._channels
+        self._sink.stop()
+        self._io = self._sink.start()
+        self._rate = rate
+        self._channels = channels
+        if not self._playing and self._sink is not None:
+            self._sink.suspend()
+
+    def set_playing(self, on):
+        self._playing = on
+        if self._sink is None:
+            return
+        if on:
+            self._sink.resume()
+        else:
+            self._sink.suspend()
+
+    def stop(self):
+        if self._sink is not None:
+            self._sink.stop()
+            self._sink = None
+            self._io = None
+
+
 def _concat_trim(parts, need):
     if not parts:
         return {}
@@ -107,6 +264,15 @@ class Recorder(QObject):
 
     def write_roll(self, data):
         self._q.put((EV_ROLL, self._now(), _pack_channels(data, None)))
+
+    def write_audio(self, pcm, rate, channels):
+        n = len(pcm)
+        if n < 2:
+            return
+        bytes_ps = max(1, int(rate) * int(channels) * 2)
+        dur_ns = n * 1_000_000_000 // bytes_ps
+        t_ns = max(0, self._now() - dur_ns)
+        self._q.put((EV_AUDIO, t_ns, _pack_audio(pcm, rate, channels)))
 
     def close(self):
         self._q.put(None)
@@ -222,16 +388,17 @@ class RecordingReader:
         self.duration_ns = duration
 
     def read_event(self):
-        hdr = self._f.read(_EVENT_HDR.size)
-        if len(hdr) < _EVENT_HDR.size:
-            return None
-        payload_len, typ, _flags, _res, t_ns = _EVENT_HDR.unpack(hdr)
-        payload = self._f.read(payload_len)
-        if len(payload) < payload_len:
-            return None
-        if typ not in (EV_CONFIG, EV_FRAME, EV_ROLL):
-            return None
-        return typ, t_ns, payload
+        while True:
+            hdr = self._f.read(_EVENT_HDR.size)
+            if len(hdr) < _EVENT_HDR.size:
+                return None
+            payload_len, typ, _flags, _res, t_ns = _EVENT_HDR.unpack(hdr)
+            payload = self._f.read(payload_len)
+            if len(payload) < payload_len:
+                return None
+            if typ not in _KNOWN:
+                continue
+            return typ, t_ns, payload
 
     def seek_offset(self, offset):
         self._f.seek(offset)
@@ -251,6 +418,8 @@ class PlaybackThread(QThread):
     new_frame = pyqtSignal(dict, bool)
     roll_chunk = pyqtSignal(dict)
     apply_config = pyqtSignal(dict)
+    audio_chunk = pyqtSignal(object, int, int)
+    audio_reset = pyqtSignal()
     position = pyqtSignal(object)
     ended = pyqtSignal()
     error = pyqtSignal(str)
@@ -359,6 +528,14 @@ class PlaybackThread(QThread):
         finally:
             self._reader.close()
 
+    def _last_of(self, i, types):
+        kfs = self._reader.keyframes
+        while i >= 0:
+            if kfs[i][3] in types:
+                return i
+            i -= 1
+        return -1
+
     def _apply_seek(self, target):
         kfs = self._reader.keyframes
         times = self._reader._kf_times
@@ -367,25 +544,50 @@ class PlaybackThread(QThread):
         i = bisect.bisect_right(times, target) - 1
         if i < 0:
             i = 0
-        t_ns, offset, cfg_idx, typ = kfs[i]
+        _t_ns, offset, cfg_idx, typ = kfs[i]
         snap = self._reader.configs[cfg_idx]
         self.apply_config.emit(snap)
-        if typ == EV_ROLL:
-            preload = self._roll_preload(i, snap)
+        self.audio_reset.emit()
+        vis_i = self._last_of(i, (EV_FRAME, EV_ROLL))
+        consumed_extra = False
+        if vis_i >= 0 and kfs[vis_i][3] == EV_ROLL:
+            preload = self._roll_preload(vis_i, snap)
             if preload:
                 self.roll_chunk.emit(preload)
+        elif vis_i >= 0:
+            ev = self._reader.peek_event(kfs[vis_i][1])
+            if ev is not None:
+                self._dispatch(ev)
+        elif typ == EV_CONFIG:
             self._reader.seek_offset(offset)
             self._reader.read_event()
-            return self._reader.read_event()
+            nxt = self._reader.read_event()
+            if nxt is not None and nxt[0] in (EV_FRAME, EV_ROLL):
+                self._dispatch(nxt)
+                consumed_extra = True
+        if self.is_playing():
+            self._emit_audio_tail(i, target)
         self._reader.seek_offset(offset)
-        ev = self._reader.read_event()
-        if ev is not None:
-            self._dispatch(ev)
+        self._reader.read_event()
         nxt = self._reader.read_event()
-        if ev is not None and ev[0] == EV_CONFIG and nxt is not None and nxt[0] in (EV_FRAME, EV_ROLL):
-            self._dispatch(nxt)
-            return self._reader.read_event()
+        if consumed_extra and nxt is not None:
+            nxt = self._reader.read_event()
         return nxt
+
+    def _emit_audio_tail(self, i, target):
+        a = self._last_of(i, (EV_AUDIO,))
+        if a < 0:
+            return
+        ev = self._reader.peek_event(self._reader.keyframes[a][1])
+        if ev is None:
+            return
+        pcm, rate, channels = _unpack_audio(ev[2])
+        t0 = ev[1]
+        bytes_ps = max(1, rate * channels * 2)
+        skip = int((target - t0) * bytes_ps / 1_000_000_000)
+        skip = max(0, skip - (skip % (channels * 2)))
+        if skip < len(pcm):
+            self.audio_chunk.emit(pcm[skip:], rate, channels)
 
     def _roll_preload(self, i, snap):
         need = int(snap.get("display_samples") or 0)
@@ -420,3 +622,6 @@ class PlaybackThread(QThread):
         elif typ == EV_ROLL:
             data, _trig = _unpack_channels(payload)
             self.roll_chunk.emit(data)
+        elif typ == EV_AUDIO:
+            pcm, rate, channels = _unpack_audio(payload)
+            self.audio_chunk.emit(pcm, rate, channels)
