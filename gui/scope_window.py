@@ -1031,6 +1031,7 @@ class ScopeWindow(QMainWindow):
         self._ch_margin.set_interactive(False)
         self._playback_bar.setVisible(True)
         self._playback_bar.set_duration_ns(player.duration_ns)
+        self._playback_bar.set_envelope(player.envelope)
         self._playback_bar.set_playing(True)
         player.new_frame.connect(self.on_new_frame)
         player.roll_chunk.connect(self.on_roll_chunk)
@@ -1049,6 +1050,7 @@ class ScopeWindow(QMainWindow):
             self._player.wait()
             self._player.deleteLater()
             self._player = None
+        self._playback_bar.set_envelope([])
         self._playback_bar.setVisible(False)
         self._controls.set_live_enabled(True)
         self._trigger_marker.setMovable(True)

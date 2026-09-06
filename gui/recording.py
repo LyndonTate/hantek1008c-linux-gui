@@ -7,6 +7,7 @@ import bisect
 
 import numpy as np
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
+from PyQt6 import sip
 
 try:
     from PyQt6.QtMultimedia import QAudioSource, QAudioSink, QAudioFormat, QMediaDevices
@@ -29,6 +30,8 @@ _AUDIO_HDR = struct.Struct("<IBBH")
 
 _EVENT_HDR = struct.Struct("<IBBHQ")
 _KF = struct.Struct("<QQII")
+INDEX_ENV_MAGIC = b"HSENV001"
+_ENV = struct.Struct("<QH")
 
 
 def _clean(obj):
@@ -84,6 +87,14 @@ def _pack_audio(pcm, rate, channels):
 def _unpack_audio(payload):
     rate, channels, _fmt, _res = _AUDIO_HDR.unpack_from(payload, 0)
     return payload[_AUDIO_HDR.size:], int(rate), int(channels)
+
+
+def _pcm_peak(pcm):
+    n = len(pcm) // 2
+    if n <= 0:
+        return 0
+    samples = np.frombuffer(pcm, dtype="<i2", count=n)
+    return int(np.max(np.abs(samples.astype(np.int32))))
 
 
 def _audio_format():
@@ -150,8 +161,13 @@ class MicRecorder(QObject):
         self._buf.clear()
         if self._src is not None:
             self._src.stop()
+            self._src.deleteLater()
             self._src = None
             self._io = None
+
+
+def _qt_alive(obj):
+    return obj is not None and not sip.isdeleted(obj)
 
 
 class AudioPlayer(QObject):
@@ -163,12 +179,26 @@ class AudioPlayer(QObject):
         self._channels = AUDIO_CHANNELS
         self._playing = True
 
+    def _restart_io(self):
+        if not _qt_alive(self._sink):
+            self._sink = None
+            self._io = None
+            return False
+        self._io = self._sink.start()
+        if not _qt_alive(self._io):
+            self._io = None
+            return False
+        if not self._playing:
+            self._sink.suspend()
+        return True
+
     def _ensure(self, rate, channels):
         if not HAS_AUDIO:
             return False
-        if (self._sink is not None and self._io is not None
-                and self._rate == rate and self._channels == channels):
-            return True
+        if _qt_alive(self._sink) and self._rate == rate and self._channels == channels:
+            if _qt_alive(self._io):
+                return True
+            return self._restart_io()
         self.stop()
         dev = QMediaDevices.defaultAudioOutput()
         if dev.isNull():
@@ -179,37 +209,34 @@ class AudioPlayer(QObject):
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
         self._sink = QAudioSink(dev, fmt, self)
         self._sink.setBufferSize(rate * channels * 2)
-        self._io = self._sink.start()
-        if self._io is None:
-            self._sink = None
-            return False
         self._rate = rate
         self._channels = channels
-        if not self._playing:
-            self._sink.suspend()
-        return True
+        return self._restart_io()
 
     def write(self, pcm, rate, channels):
         if not self._playing:
             return
         if not self._ensure(rate, channels):
             return
-        self._io.write(pcm)
+        try:
+            self._io.write(pcm)
+        except RuntimeError:
+            self._io = None
+            if self._ensure(rate, channels):
+                self._io.write(pcm)
 
     def reset(self):
-        if self._sink is None:
+        if not _qt_alive(self._sink):
+            self._sink = None
+            self._io = None
             return
-        rate, channels = self._rate, self._channels
-        self._sink.stop()
-        self._io = self._sink.start()
-        self._rate = rate
-        self._channels = channels
-        if not self._playing and self._sink is not None:
-            self._sink.suspend()
+        self._io = None
+        self._sink.reset()
+        self._restart_io()
 
     def set_playing(self, on):
         self._playing = on
-        if self._sink is None:
+        if not _qt_alive(self._sink):
             return
         if on:
             self._sink.resume()
@@ -217,10 +244,11 @@ class AudioPlayer(QObject):
             self._sink.suspend()
 
     def stop(self):
-        if self._sink is not None:
+        self._io = None
+        if _qt_alive(self._sink):
             self._sink.stop()
-            self._sink = None
-            self._io = None
+            self._sink.deleteLater()
+        self._sink = None
 
 
 def _concat_trim(parts, need):
@@ -281,6 +309,7 @@ class Recorder(QObject):
     def _run(self):
         configs = []
         keyframes = []
+        envelope = []
         duration = 0
         try:
             with open(self._path, "wb") as f:
@@ -297,6 +326,9 @@ class Recorder(QObject):
                     f.flush()
                     if typ == EV_CONFIG:
                         configs.append((t_ns, json.loads(payload.decode())))
+                    elif typ == EV_AUDIO:
+                        pcm, _rate, _ch = _unpack_audio(payload)
+                        envelope.append((t_ns, _pcm_peak(pcm)))
                     cfg_idx = len(configs) - 1
                     if cfg_idx >= 0:
                         keyframes.append((t_ns, offset, cfg_idx, typ))
@@ -312,6 +344,10 @@ class Recorder(QObject):
                 f.write(struct.pack("<I", len(keyframes)))
                 for t_ns, offset, cfg_idx, typ in keyframes:
                     f.write(_KF.pack(t_ns, offset, cfg_idx, typ))
+                f.write(INDEX_ENV_MAGIC)
+                f.write(struct.pack("<I", len(envelope)))
+                for t_ns, peak in envelope:
+                    f.write(_ENV.pack(t_ns, min(peak, 65535)))
                 f.flush()
                 f.seek(0)
                 f.write(_pack_header(index_offset, self._start_wall))
@@ -334,6 +370,7 @@ class RecordingReader:
         self._index_offset, self.start_wall_ns = struct.unpack_from("<QQ", hdr, 12)
         self.configs = []
         self.keyframes = []
+        self.envelope = []
         self.duration_ns = 0
         if self._index_offset and self._load_index():
             pass
@@ -362,14 +399,37 @@ class RecordingReader:
                 keyframes.append((t_ns, offset, cfg_idx, typ))
             self.configs = configs
             self.keyframes = keyframes
+            mag = self._f.read(8)
+            if mag == INDEX_ENV_MAGIC:
+                n_env = struct.unpack("<I", self._f.read(4))[0]
+                env = []
+                for _ in range(n_env):
+                    t_ns, peak = _ENV.unpack(self._f.read(_ENV.size))
+                    env.append((t_ns, peak))
+                self.envelope = env
+            else:
+                self._scan_envelope()
             return True
         except Exception:
             return False
+
+    def _scan_envelope(self):
+        env = []
+        for t_ns, offset, _cfg, typ in self.keyframes:
+            if typ != EV_AUDIO:
+                continue
+            ev = self.peek_event(offset)
+            if ev is None:
+                continue
+            pcm, _rate, _ch = _unpack_audio(ev[2])
+            env.append((t_ns, _pcm_peak(pcm)))
+        self.envelope = env
 
     def _rebuild_index(self):
         self._f.seek(HEADER_SIZE)
         configs = []
         keyframes = []
+        envelope = []
         duration = 0
         while True:
             offset = self._f.tell()
@@ -379,12 +439,16 @@ class RecordingReader:
             typ, t_ns, payload = ev
             if typ == EV_CONFIG:
                 configs.append(json.loads(payload.decode()))
+            elif typ == EV_AUDIO:
+                pcm, _rate, _ch = _unpack_audio(payload)
+                envelope.append((t_ns, _pcm_peak(pcm)))
             cfg_idx = len(configs) - 1
             if cfg_idx >= 0:
                 keyframes.append((t_ns, offset, cfg_idx, typ))
             duration = t_ns
         self.configs = configs
         self.keyframes = keyframes
+        self.envelope = envelope
         self.duration_ns = duration
 
     def read_event(self):
@@ -428,6 +492,7 @@ class PlaybackThread(QThread):
         super().__init__(parent)
         self._reader = RecordingReader(path)
         self.duration_ns = self._reader.duration_ns
+        self.envelope = self._reader.envelope
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._playing = True
