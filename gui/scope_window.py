@@ -1,10 +1,14 @@
+import os
 import sys
+import time
 import logging
 import numpy as np
 import pyqtgraph as pg
 
 log = logging.getLogger(__name__)
-from PyQt6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QApplication
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QApplication, QFileDialog,
+)
 from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt
 
@@ -13,6 +17,8 @@ from gui.acquisition import AcquisitionThread
 from gui.channel_margin import ChannelMarginWidget
 from gui.cursor_overlay import CursorOverlay
 from gui.measurements import MEASURE_TYPES, measure_value, format_measure
+from gui.recording import Recorder, PlaybackThread
+from gui.playback_bar import PlaybackBar
 from vendor.hantek1008 import Hantek1008
 
 TIME_DIVS = 10
@@ -189,6 +195,9 @@ class ScopeWindow(QMainWindow):
         self._roll_buf = {}              # {ch_id: np.ndarray} ring buffer of volts
         self._roll_head = 0              # next write index into the ring buffers
         self._ns_per_sample = 0.0
+        self._recorder = None
+        self._player = None
+        self._pending_h_frac = None
 
         self._setup_ui()
         self._start_acquisition()
@@ -206,7 +215,16 @@ class ScopeWindow(QMainWindow):
         self._ch_margin = ChannelMarginWidget(self._plot_widget)
         self._ch_margin.channel_dragged.connect(self._on_channel_dragged)
         layout.addWidget(self._ch_margin)
-        layout.addWidget(self._plot_widget, stretch=1)
+
+        plot_col = QWidget()
+        plot_col_layout = QVBoxLayout(plot_col)
+        plot_col_layout.setContentsMargins(0, 0, 0, 0)
+        plot_col_layout.setSpacing(0)
+        plot_col_layout.addWidget(self._plot_widget, stretch=1)
+        self._playback_bar = PlaybackBar()
+        self._playback_bar.setVisible(False)
+        plot_col_layout.addWidget(self._playback_bar)
+        layout.addWidget(plot_col, stretch=1)
 
         # Right panel: status bar on top, controls below
         right = QWidget()
@@ -253,6 +271,11 @@ class ScopeWindow(QMainWindow):
         self._controls.acq_mode_changed.connect(self._on_acq_mode_changed)
         self._controls.cursor_toggled.connect(self._on_cursor_toggled)
         self._controls.auto_measure_changed.connect(self._on_auto_measure_changed)
+        self._controls.record_clicked.connect(self._on_record_clicked)
+        self._controls.open_clicked.connect(self._on_open_clicked)
+        self._playback_bar.play_clicked.connect(self._on_play_clicked)
+        self._playback_bar.live_clicked.connect(self._exit_playback)
+        self._playback_bar.seek_ns.connect(self._on_seek_ns)
 
         # The trigger markers are always active — the hardware trigger is always
         # armed. In auto mode the device free-runs when no edge matches.
@@ -336,9 +359,9 @@ class ScopeWindow(QMainWindow):
 
     def _on_h_trigger_moved(self):
         pos = int(self._h_trigger_marker.value())
-        self._acq.queue_hw_trigger_pre_samples(pos)
-        # In fast-fixed mode the marker is realised in software (see _redraw),
-        # so repaint immediately for snappy feedback.
+        if self._acq is not None:
+            self._acq.queue_hw_trigger_pre_samples(pos)
+        self._record_config()
         if self._last_frame_np:
             self._redraw()
 
@@ -391,12 +414,15 @@ class ScopeWindow(QMainWindow):
         # Trigger fires at the real wire voltage, independent of the display offset
         self._trigger_level_volts = self._trigger_marker.value() - trig_offset
         trig_adc = self._volts_to_adc(self._trigger_level_volts, vscales_dict[trig_ch], trig_ch)
-        self._acq.queue_trigger_level(trig_adc)
+        if self._acq is not None:
+            self._acq.queue_trigger_level(trig_adc)
+        self._record_config()
 
     def _on_channel_dragged(self, ch_id, new_offset):
         self._channel_offsets[ch_id] = new_offset
         if ch_id in self._channel_data:
             self._channel_data[ch_id]["curve"].setPos(0, new_offset)
+        self._record_config()
         trig_ch = self._controls.get_trigger_channel()
         if ch_id == trig_ch:
             # Keep trigger marker visually aligned with the moving trace
@@ -463,7 +489,11 @@ class ScopeWindow(QMainWindow):
         self._frame_size = frame_size
         self._last_frame_np = {}
 
-        if is_first_init:
+        if self._pending_h_frac is not None:
+            new_h_pos = max(0, min(int(round(self._pending_h_frac * (self._display_samples - 1))),
+                                   self._display_samples - 1))
+            self._pending_h_frac = None
+        elif is_first_init:
             new_h_pos = self._display_samples // 2
         else:
             # Preserve fractional screen position across timebase changes
@@ -475,7 +505,9 @@ class ScopeWindow(QMainWindow):
         self._h_trigger_marker.setBounds((0, self._display_samples - 1))
         self._h_trigger_marker.setValue(new_h_pos)
         self._h_trigger_marker.blockSignals(False)
-        self._acq.queue_hw_trigger_pre_samples(new_h_pos)
+        if self._acq is not None:
+            self._acq.queue_hw_trigger_pre_samples(new_h_pos)
+        self._record_config()
 
         self._plot_widget.setXRange(0, self._display_samples - 1, padding=0)
 
@@ -522,6 +554,8 @@ class ScopeWindow(QMainWindow):
         self._trigger_marker.blockSignals(False)
 
     def _start_acquisition(self):
+        if self._player is not None:
+            return
         self._restarting = False          # now safe to accept frames from new thread
         active = self._controls.get_active_channels()
         hw_active = _pad_channels_to_pairs(active)  # hardware requires channels in pairs
@@ -572,10 +606,13 @@ class ScopeWindow(QMainWindow):
         self._acq.start()
 
     def _restart_acquisition(self):
+        if self._player is not None:
+            return
         if self._acq is not None:
             self._acq.stop()
             self._restarting = True       # discard any frames that arrive from here on
-            self._set_status("● Updating", "#ffaa00")
+            if self._recorder is None:
+                self._set_status("● Updating", "#ffaa00")
             QApplication.processEvents()  # paint the status indicator immediately
             self._acq.wait()
             QApplication.processEvents()  # drain signals queued while wait() was blocking
@@ -591,14 +628,17 @@ class ScopeWindow(QMainWindow):
         )
 
     def on_new_frame(self, data, triggered):
-        if self._restarting:
-            return                        # discard stale frames from the dying thread
-        mode = self._controls.get_acq_mode()
-        if mode == "stopped":
-            return                        # single-shot captured; display is frozen
+        playing = self._player is not None
+        if not playing:
+            if self._restarting:
+                return
+            mode = self._controls.get_acq_mode()
+            if mode == "stopped":
+                return
+        else:
+            mode = self._controls.get_acq_mode()
 
         expected = set(self._controls.get_active_channels())
-        # data may include silent partner channels (hardware pair padding); filter them out
         data = {k: v for k, v in data.items() if k in expected}
         if set(data.keys()) != expected:
             return
@@ -608,7 +648,7 @@ class ScopeWindow(QMainWindow):
         if not self._initialized:
             self._init_buffer(frame_size)
             self._initialized = True
-            self._set_status("● Live", "#44cc44")
+            self._refresh_status()
 
         self._last_frame_triggered = triggered
         self._last_frame_np = {
@@ -618,10 +658,13 @@ class ScopeWindow(QMainWindow):
         self._redraw()
         self._update_auto_measures()
 
-        if mode == "single" and triggered:
-            # Real trigger caught — freeze on this frame and deselect all modes.
+        if not playing and self._recorder is not None:
+            self._recorder.write_frame(self._last_frame_np, triggered)
+
+        if not playing and mode == "single" and triggered:
             self._controls.clear_mode_selection()
-            self._set_status("● Stopped", "#ff5555")
+            self._record_config()
+            self._refresh_status()
 
     def _init_roll_display(self):
         """Set up the rolling-trace display: time-base, grid, curves and the
@@ -674,13 +717,16 @@ class ScopeWindow(QMainWindow):
         margin_channels = {ch: (self._channel_offsets.get(ch, 0.0), CHANNEL_COLORS[ch])
                            for ch in active}
         self._ch_margin.set_channels(margin_channels, yrange)
+        self._record_config()
 
     def on_roll_chunk(self, data):
-        if self._restarting or not self._roll_mode:
+        playing = self._player is not None
+        if not playing and (self._restarting or not self._roll_mode):
+            return
+        if playing and not self._roll_mode:
             return
 
         expected = set(self._controls.get_active_channels())
-        # filter out silent partner channels from hardware pair padding
         data = {k: v for k, v in data.items() if k in expected}
         if set(data.keys()) != expected:
             return
@@ -688,7 +734,7 @@ class ScopeWindow(QMainWindow):
         if not self._initialized:
             self._init_roll_display()
             self._initialized = True
-            self._set_status("● Roll", "#44cc44")
+            self._refresh_status()
 
         n = self._display_samples
         # All active channels advance together, so the chunk length is the same
@@ -716,6 +762,10 @@ class ScopeWindow(QMainWindow):
         self._redraw_roll()
         self._update_auto_measures()
 
+        if not playing and self._recorder is not None:
+            self._recorder.write_roll({ch: np.asarray(samples[:count], dtype=np.float32)
+                                      for ch, samples in data.items()})
+
     def _redraw_roll(self):
         for ch, buf in self._roll_buf.items():
             info = self._channel_data.get(ch)
@@ -724,6 +774,7 @@ class ScopeWindow(QMainWindow):
 
     def _on_time_div_changed(self, ns):
         log.info("===== USER changed time/div -> %d ns/div =====", ns)
+        self._record_config()
         self._restart_acquisition()
 
     def _on_channel_toggled(self, ch_idx, is_on):
@@ -732,32 +783,33 @@ class ScopeWindow(QMainWindow):
             vscale = self._controls.get_vscales()[ch_idx]
             self._channel_offsets[ch_idx] = -ch_idx * 0.5 * vscale
         self._update_yrange()
-        self._update_trigger_marker_label()   # trigger may have auto-moved
+        self._update_trigger_marker_label()
+        self._record_config()
         self._restart_acquisition()
 
     def _on_trigger_channel_changed(self, ch_idx):
         self._update_trigger_marker_label()
+        self._record_config()
         self._restart_acquisition()
 
     def _on_trigger_slope_changed(self, slope):
+        self._record_config()
         self._restart_acquisition()
 
     def _on_acq_mode_changed(self, mode):
         if not self._roll_mode:
-            # Trigger markers stay hidden while rolling (no trigger applies).
             self._trigger_marker.setVisible(True)
             self._h_trigger_marker.setVisible(True)
         if self._acq is not None:
             self._acq.set_capture_mode(mode)
+        self._record_config()
         if self._roll_mode:
-            return                            # acquisition mode has no effect in roll mode
-        if mode == "single":
-            self._set_status("● Armed", "#ffaa00")
-        elif self._initialized:
-            self._set_status("● Live", "#44cc44")
+            return
+        self._refresh_status()
 
     def _on_vscale_changed(self, ch_idx, vscale):
         self._update_yrange()
+        self._record_config()
         self._restart_acquisition()
 
     def _on_cursor_toggled(self, enabled):
@@ -836,10 +888,201 @@ class ScopeWindow(QMainWindow):
 
     def _on_error(self, msg):
         print(f"Device error: {msg}", file=sys.stderr)
-        # Invalidate the cached device so the next restart does a full connect/init.
         self._device = None
 
+    def _get_snapshot(self):
+        n = max(1, int(self._display_samples) - 1) if self._display_samples else 1
+        snap = self._controls.get_snapshot()
+        snap["offsets"] = [float(self._channel_offsets.get(i, 0.0)) for i in range(8)]
+        snap["trigger_level_volts"] = float(self._trigger_level_volts)
+        snap["h_trigger_frac"] = float(self._h_trigger_marker.value()) / n
+        snap["display_samples"] = int(self._display_samples)
+        return snap
+
+    def _record_config(self):
+        if self._recorder is None:
+            return
+        self._recorder.write_config(self._get_snapshot())
+
+    def _refresh_status(self):
+        if self._player is not None:
+            if self._player.is_playing():
+                self._set_status("● Playing", "#44aaff")
+            else:
+                self._set_status("● Paused", "#44aaff")
+            return
+        if self._recorder is not None:
+            self._set_status("● Recording", "#ff5555")
+            return
+        mode = self._controls.get_acq_mode()
+        if mode == "stopped":
+            self._set_status("● Stopped", "#ff5555")
+        elif mode == "single":
+            self._set_status("● Armed", "#ffaa00")
+        elif self._roll_mode and self._initialized:
+            self._set_status("● Roll", "#44cc44")
+        elif self._initialized:
+            self._set_status("● Live", "#44cc44")
+
+    def _auto_record_path(self):
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.abspath(f"hanscope-{stamp}.hsrec")
+        n = 2
+        while os.path.exists(path):
+            path = os.path.abspath(f"hanscope-{stamp}-{n}.hsrec")
+            n += 1
+        return path
+
+    def _stop_recorder(self):
+        rec = self._recorder
+        self._recorder = None
+        if rec is not None:
+            try:
+                rec.error.disconnect()
+            except TypeError:
+                pass
+            rec.close()
+        self._controls.set_recording(False)
+
+    def _on_record_clicked(self):
+        if self._player is not None:
+            return
+        if self._recorder is not None:
+            self._stop_recorder()
+            self._refresh_status()
+            return
+        path = self._auto_record_path()
+        rec = Recorder(path, self._get_snapshot(), parent=self)
+        rec.error.connect(self._on_record_error)
+        self._recorder = rec
+        self._controls.set_recording(True, path)
+        self._refresh_status()
+
+    def _on_record_error(self, msg):
+        print(f"Record error: {msg}", file=sys.stderr)
+        self._stop_recorder()
+        self._refresh_status()
+
+    def _on_open_clicked(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open recording", os.getcwd(), "Hanscope recording (*.hsrec)")
+        if path:
+            self._enter_playback(path)
+
+    def _enter_playback(self, path):
+        self._stop_recorder()
+        if self._player is not None:
+            self._player.stop()
+            self._player.wait()
+            self._player.deleteLater()
+            self._player = None
+        if self._acq is not None:
+            self._acq.stop()
+            self._restarting = True
+            QApplication.processEvents()
+            self._acq.wait()
+            QApplication.processEvents()
+            self._acq = None
+            self._restarting = False
+        try:
+            player = PlaybackThread(path, parent=self)
+        except Exception as e:
+            print(f"Playback error: {e}", file=sys.stderr)
+            self._start_acquisition()
+            return
+        self._player = player
+        self._controls.set_live_enabled(False)
+        self._trigger_marker.setMovable(False)
+        self._h_trigger_marker.setMovable(False)
+        self._ch_margin.set_interactive(False)
+        self._playback_bar.setVisible(True)
+        self._playback_bar.set_duration_ns(player.duration_ns)
+        self._playback_bar.set_playing(True)
+        player.new_frame.connect(self.on_new_frame)
+        player.roll_chunk.connect(self.on_roll_chunk)
+        player.apply_config.connect(self._apply_playback_config)
+        player.position.connect(self._playback_bar.set_position_ns)
+        player.ended.connect(self._on_playback_ended)
+        player.error.connect(self._on_playback_error)
+        player.start()
+        self._refresh_status()
+
+    def _exit_playback(self):
+        if self._player is not None:
+            self._player.stop()
+            self._player.wait()
+            self._player.deleteLater()
+            self._player = None
+        self._playback_bar.setVisible(False)
+        self._controls.set_live_enabled(True)
+        self._trigger_marker.setMovable(True)
+        self._h_trigger_marker.setMovable(True)
+        self._ch_margin.set_interactive(True)
+        self._pending_h_frac = None
+        self._initialized = False
+        self._start_acquisition()
+
+    def _on_play_clicked(self):
+        if self._player is None:
+            return
+        if self._player.is_playing():
+            self._player.pause()
+            self._playback_bar.set_playing(False)
+        else:
+            self._player.play()
+            self._playback_bar.set_playing(True)
+        self._refresh_status()
+
+    def _on_seek_ns(self, ns):
+        if self._player is not None:
+            self._player.seek(int(ns))
+
+    def _on_playback_ended(self):
+        self._playback_bar.set_playing(False)
+        self._refresh_status()
+
+    def _on_playback_error(self, msg):
+        print(f"Playback error: {msg}", file=sys.stderr)
+        self._exit_playback()
+
+    def _apply_playback_config(self, snap):
+        self._controls.apply_snapshot(snap)
+        offsets = snap.get("offsets") or [0.0] * 8
+        self._channel_offsets = {i: float(offsets[i]) for i in range(8)}
+        self._trigger_level_volts = float(snap.get("trigger_level_volts") or 0.0)
+        frac = snap.get("h_trigger_frac")
+        self._pending_h_frac = float(frac) if frac is not None else 0.5
+        ns = int(snap["ns_per_div"])
+        self._roll_mode = Hantek1008.is_roll_mode_ns_per_div(ns)
+        self._trigger_marker.setVisible(not self._roll_mode)
+        self._h_trigger_marker.setVisible(not self._roll_mode)
+        trig_ch = int(snap["trigger_ch"])
+        trig_offset = self._channel_offsets.get(trig_ch, 0.0)
+        self._trigger_marker.blockSignals(True)
+        self._trigger_marker.setValue(self._trigger_level_volts + trig_offset)
+        self._trigger_marker.blockSignals(False)
+        self._update_trigger_marker_label()
+        self._initialized = False
+        self._frame_size = 0
+        self._last_frame_np = {}
+        self._update_yrange()
+        active = [i for i in range(8) if snap["active"][i]]
+        vscales_dict = self._controls.get_vscales()
+        active_vscales = [vscales_dict[ch] for ch in active]
+        yrange = _yrange_for(active_vscales)
+        margin_channels = {
+            ch: (self._channel_offsets.get(ch, 0.0), CHANNEL_COLORS[ch])
+            for ch in active
+        }
+        self._ch_margin.set_channels(margin_channels, yrange)
+
     def closeEvent(self, event):
+        self._stop_recorder()
+        if self._player is not None:
+            self._player.stop()
+            self._player.wait()
+            self._player.deleteLater()
+            self._player = None
         if self._acq is not None:
             self._acq.stop()
             self._acq.wait()

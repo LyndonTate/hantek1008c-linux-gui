@@ -21,6 +21,7 @@ class ChannelMarginWidget(QWidget):
         self._dragging = None
         self._drag_y_start = 0
         self._drag_offset_start = 0.0
+        self._interactive = True
         self.setFixedWidth(20)
         self.setStyleSheet("background-color: #000000;")
         self.setMouseTracking(True)
@@ -41,6 +42,12 @@ class ChannelMarginWidget(QWidget):
     def set_yrange(self, yrange: float):
         self._yrange = yrange
         self.update()
+
+    def set_interactive(self, on):
+        self._interactive = on
+        if not on:
+            self._dragging = None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
 
     # --------------------------------------------------------- coordinate math
 
@@ -104,6 +111,8 @@ class ChannelMarginWidget(QWidget):
         return best
 
     def mousePressEvent(self, event):
+        if not self._interactive:
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             ch = self._channel_at_y(event.pos().y())
             if ch is not None:
@@ -114,6 +123,8 @@ class ChannelMarginWidget(QWidget):
                 event.accept()
 
     def mouseMoveEvent(self, event):
+        if not self._interactive:
+            return
         if self._dragging is not None:
             dy = event.pos().y() - self._drag_y_start
             _, h = self._vb_top_and_height()

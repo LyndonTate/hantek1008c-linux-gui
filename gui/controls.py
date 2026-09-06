@@ -120,6 +120,8 @@ class ControlsPanel(QWidget):
     acq_mode_changed = pyqtSignal(str)       # "auto" | "normal" | "single"
     cursor_toggled = pyqtSignal(bool)        # measurement cursor on/off
     auto_measure_changed = pyqtSignal()
+    record_clicked = pyqtSignal()
+    open_clicked = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,10 +137,28 @@ class ControlsPanel(QWidget):
         self._acq_mode = "auto"
         self._cursor_on = False
         self._auto_on = {(ch, mid): False for ch in range(8) for mid, _, _ in MEASURE_TYPES}
+        self._live = True
+        self._recording = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 8)
         layout.setSpacing(6)
+
+        rec_row = QWidget()
+        rec_row.setStyleSheet("background-color: transparent;")
+        rec_layout = QHBoxLayout(rec_row)
+        rec_layout.setContentsMargins(0, 0, 0, 0)
+        rec_layout.setSpacing(4)
+        self._record_btn = QPushButton("Record")
+        self._record_btn.setToolTip("Record live traces to a local .hsrec file")
+        self._record_btn.clicked.connect(self.record_clicked.emit)
+        self._open_btn = QPushButton("Open")
+        self._open_btn.setToolTip("Open a recording for playback")
+        self._open_btn.clicked.connect(self.open_clicked.emit)
+        rec_layout.addWidget(self._record_btn)
+        rec_layout.addWidget(self._open_btn)
+        layout.addWidget(rec_row)
+        self._update_record_btn_style()
 
         # Time/Div
         lbl = QLabel("Time / Div")
@@ -491,3 +511,79 @@ class ControlsPanel(QWidget):
 
     def get_vscales(self):
         return dict(self._vscales)
+
+    def get_snapshot(self):
+        return {
+            "ns_per_div": int(self.get_ns_per_div()),
+            "active": [bool(self._active[i]) for i in range(8)],
+            "vscales": [float(self._vscales[i]) for i in range(8)],
+            "trigger_ch": int(self._trigger_ch),
+            "trigger_slope": self._trigger_slope,
+            "acq_mode": self._acq_mode,
+        }
+
+    def apply_snapshot(self, snap):
+        self._time_combo.blockSignals(True)
+        idx = self._time_combo.findData(snap["ns_per_div"])
+        if idx >= 0:
+            self._time_combo.setCurrentIndex(idx)
+        self._time_combo.blockSignals(False)
+
+        self._acq_mode = snap["acq_mode"]
+        self._update_mode_btn_styles()
+
+        self._trigger_slope = snap["trigger_slope"]
+        self._update_slope_btn_styles()
+
+        self._trigger_ch = int(snap["trigger_ch"])
+
+        for ch in range(8):
+            self._vscales[ch] = float(snap["vscales"][ch])
+            combo = self._vscale_combos[ch]
+            combo.blockSignals(True)
+            vi = combo.findData(self._vscales[ch])
+            if vi >= 0:
+                combo.setCurrentIndex(vi)
+            combo.blockSignals(False)
+
+            on = bool(snap["active"][ch])
+            self._active[ch] = on
+            btn = self._toggle_btns[ch]
+            btn.setText("ON" if on else "OFF")
+            btn.setStyleSheet(_btn_style(CHANNEL_COLORS[ch], on))
+
+        self._update_trig_btn_styles()
+        self._refresh_auto_list()
+
+    def set_live_enabled(self, on):
+        self._live = on
+        self._time_combo.setEnabled(on)
+        for btn in (self._auto_btn, self._normal_btn, self._single_btn,
+                    self._rising_btn, self._falling_btn):
+            btn.setEnabled(on)
+        for w in self._vscale_combos + self._toggle_btns + self._trig_btns:
+            w.setEnabled(on)
+        self._record_btn.setEnabled(on)
+        self._open_btn.setEnabled(True if not on else not self._recording)
+        if on:
+            self._update_trig_btn_styles()
+
+    def set_recording(self, on, path=""):
+        self._recording = on
+        self._open_btn.setEnabled(self._live and not on)
+        if on:
+            self._record_btn.setToolTip(path)
+        else:
+            self._record_btn.setToolTip("Record live traces to a local .hsrec file")
+        self._update_record_btn_style()
+
+    def _update_record_btn_style(self):
+        if self._recording:
+            self._record_btn.setText("Stop")
+            self._record_btn.setStyleSheet(
+                "background-color: #ff5555; color: #000000; border: none; "
+                "padding: 3px 6px; font-size: 11px; font-weight: bold;"
+            )
+        else:
+            self._record_btn.setText("Record")
+            self._record_btn.setStyleSheet(_mode_btn_style(False))
