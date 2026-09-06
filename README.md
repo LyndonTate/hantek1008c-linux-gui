@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/15a113a6-694e-49ce-842e-19c3c2059689
 - Per-channel auto measurements (Freq, Period, ±Duty, ±PW, Rise/Fall, Max/Min, PkPk, Top/Base, Mid, Amp, Mean, RMS, Cycle Mean, ±Overshoot) with plot overlay
 - Draggable channel offset handles in a left margin strip
 - Channels stagger vertically on first enable so they don't stack on zero
-- Record live captures to a local `.hsrec` file (Record / Stop) and play them back offline (Open), including channel data, timing gaps, and settings (time/div, V/div, trigger, offsets). Playback has play/pause and a seek slider; the scope does not need to be connected.
+- Record live captures to a local `.hsrec` file (Record / Stop) and play them back offline (Open), including channel data, timing gaps, and settings (time/div, V/div, trigger, offsets). While recording, unmute/mute the system microphone as a synced voice-note track (starts muted). Playback has play/pause, a seek slider, and a thin audio envelope under the slider; the scope does not need to be connected.
 
 ## Requirements
 

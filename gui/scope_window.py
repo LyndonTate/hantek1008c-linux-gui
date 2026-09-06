@@ -17,7 +17,7 @@ from gui.acquisition import AcquisitionThread
 from gui.channel_margin import ChannelMarginWidget
 from gui.cursor_overlay import CursorOverlay
 from gui.measurements import MEASURE_TYPES, measure_value, format_measure
-from gui.recording import Recorder, PlaybackThread
+from gui.recording import Recorder, PlaybackThread, MicRecorder, AudioPlayer, HAS_AUDIO
 from gui.playback_bar import PlaybackBar
 from vendor.hantek1008 import Hantek1008
 
@@ -198,6 +198,8 @@ class ScopeWindow(QMainWindow):
         self._recorder = None
         self._player = None
         self._pending_h_frac = None
+        self._mic = None
+        self._audio_out = None
 
         self._setup_ui()
         self._start_acquisition()
@@ -276,6 +278,8 @@ class ScopeWindow(QMainWindow):
         self._playback_bar.play_clicked.connect(self._on_play_clicked)
         self._playback_bar.live_clicked.connect(self._exit_playback)
         self._playback_bar.seek_ns.connect(self._on_seek_ns)
+        self._controls.set_mic_available(HAS_AUDIO)
+        self._controls.mic_muted_changed.connect(self._on_mic_muted_changed)
 
         # The trigger markers are always active — the hardware trigger is always
         # armed. In auto mode the device free-runs when no edge matches.
@@ -933,7 +937,20 @@ class ScopeWindow(QMainWindow):
             n += 1
         return path
 
+    def _stop_mic(self):
+        if self._mic is not None:
+            self._mic.stop()
+            self._mic.deleteLater()
+            self._mic = None
+
+    def _stop_audio_out(self):
+        if self._audio_out is not None:
+            self._audio_out.stop()
+            self._audio_out.deleteLater()
+            self._audio_out = None
+
     def _stop_recorder(self):
+        self._stop_mic()
         rec = self._recorder
         self._recorder = None
         if rec is not None:
@@ -956,7 +973,23 @@ class ScopeWindow(QMainWindow):
         rec.error.connect(self._on_record_error)
         self._recorder = rec
         self._controls.set_recording(True, path)
+        if HAS_AUDIO:
+            mic = MicRecorder(rec, parent=self)
+            mic.set_muted(True)
+            if mic.start():
+                self._mic = mic
+                self._controls.set_mic_capture_ready(True)
+            else:
+                mic.deleteLater()
+                self._controls.set_mic_capture_ready(False)
+                print("Microphone unavailable; recording traces only", file=sys.stderr)
+        else:
+            self._controls.set_mic_capture_ready(False)
         self._refresh_status()
+
+    def _on_mic_muted_changed(self, muted):
+        if self._mic is not None:
+            self._mic.set_muted(muted)
 
     def _on_record_error(self, msg):
         print(f"Record error: {msg}", file=sys.stderr)
@@ -971,6 +1004,7 @@ class ScopeWindow(QMainWindow):
 
     def _enter_playback(self, path):
         self._stop_recorder()
+        self._stop_audio_out()
         if self._player is not None:
             self._player.stop()
             self._player.wait()
@@ -997,10 +1031,13 @@ class ScopeWindow(QMainWindow):
         self._ch_margin.set_interactive(False)
         self._playback_bar.setVisible(True)
         self._playback_bar.set_duration_ns(player.duration_ns)
+        self._playback_bar.set_envelope(player.envelope)
         self._playback_bar.set_playing(True)
         player.new_frame.connect(self.on_new_frame)
         player.roll_chunk.connect(self.on_roll_chunk)
         player.apply_config.connect(self._apply_playback_config)
+        player.audio_chunk.connect(self._on_audio_chunk)
+        player.audio_reset.connect(self._on_audio_reset)
         player.position.connect(self._playback_bar.set_position_ns)
         player.ended.connect(self._on_playback_ended)
         player.error.connect(self._on_playback_error)
@@ -1013,6 +1050,7 @@ class ScopeWindow(QMainWindow):
             self._player.wait()
             self._player.deleteLater()
             self._player = None
+        self._playback_bar.set_envelope([])
         self._playback_bar.setVisible(False)
         self._controls.set_live_enabled(True)
         self._trigger_marker.setMovable(True)
@@ -1020,6 +1058,7 @@ class ScopeWindow(QMainWindow):
         self._ch_margin.set_interactive(True)
         self._pending_h_frac = None
         self._initialized = False
+        self._stop_audio_out()
         self._start_acquisition()
 
     def _on_play_clicked(self):
@@ -1028,9 +1067,13 @@ class ScopeWindow(QMainWindow):
         if self._player.is_playing():
             self._player.pause()
             self._playback_bar.set_playing(False)
+            if self._audio_out is not None:
+                self._audio_out.set_playing(False)
         else:
             self._player.play()
             self._playback_bar.set_playing(True)
+            if self._audio_out is not None:
+                self._audio_out.set_playing(True)
         self._refresh_status()
 
     def _on_seek_ns(self, ns):
@@ -1039,7 +1082,20 @@ class ScopeWindow(QMainWindow):
 
     def _on_playback_ended(self):
         self._playback_bar.set_playing(False)
+        if self._audio_out is not None:
+            self._audio_out.set_playing(False)
         self._refresh_status()
+
+    def _on_audio_chunk(self, pcm, rate, channels):
+        if self._audio_out is None:
+            self._audio_out = AudioPlayer(parent=self)
+        playing = self._player is not None and self._player.is_playing()
+        self._audio_out.set_playing(playing)
+        self._audio_out.write(pcm, rate, channels)
+
+    def _on_audio_reset(self):
+        if self._audio_out is not None:
+            self._audio_out.reset()
 
     def _on_playback_error(self, msg):
         print(f"Playback error: {msg}", file=sys.stderr)
@@ -1078,6 +1134,7 @@ class ScopeWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_recorder()
+        self._stop_audio_out()
         if self._player is not None:
             self._player.stop()
             self._player.wait()

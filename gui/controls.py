@@ -2,7 +2,8 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QScrollArea, QFrame,
 )
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt, QSize, QRectF
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QBrush
 
 from gui.measurements import MEASURE_TYPES, MEASURE_GROUPS
 
@@ -100,6 +101,28 @@ def _auto_type_style(any_on):
             "padding: 1px 4px; font-size: 10px;")
 
 
+def _make_mic_icon(muted, hot):
+    s = 64
+    pm = QPixmap(s, s)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    ink = QColor("#111111") if hot else QColor("#dddddd")
+    pen = QPen(ink, 5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(QBrush(ink))
+    p.drawRoundedRect(QRectF(24, 8, 16, 28), 8, 8)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawArc(QRectF(16, 16, 32, 32), 0, -180 * 16)
+    p.drawLine(32, 48, 32, 54)
+    p.drawLine(20, 54, 44, 54)
+    if muted:
+        p.setPen(QPen(QColor("#ff5555"), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(12, 52, 52, 12)
+    p.end()
+    return QIcon(pm)
+
+
 def _auto_dot_style(color, is_on, ch_active):
     if not ch_active:
         return ("background-color: #151515; color: #2a2a2a; border: 1px solid #222222; "
@@ -122,6 +145,7 @@ class ControlsPanel(QWidget):
     auto_measure_changed = pyqtSignal()
     record_clicked = pyqtSignal()
     open_clicked = pyqtSignal()
+    mic_muted_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -139,6 +163,10 @@ class ControlsPanel(QWidget):
         self._auto_on = {(ch, mid): False for ch in range(8) for mid, _, _ in MEASURE_TYPES}
         self._live = True
         self._recording = False
+        self._mic_available = True
+        self._mic_capture_ready = False
+        self._mic_icon_live = _make_mic_icon(False, True)
+        self._mic_icon_muted = _make_mic_icon(True, False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 10, 8, 8)
@@ -152,13 +180,21 @@ class ControlsPanel(QWidget):
         self._record_btn = QPushButton("Record")
         self._record_btn.setToolTip("Record live traces to a local .hsrec file")
         self._record_btn.clicked.connect(self.record_clicked.emit)
+        self._mic_btn = QPushButton()
+        self._mic_btn.setCheckable(True)
+        self._mic_btn.setChecked(False)
+        self._mic_btn.setFixedWidth(32)
+        self._mic_btn.setIconSize(QSize(16, 16))
+        self._mic_btn.clicked.connect(self._on_mic_clicked)
         self._open_btn = QPushButton("Open")
         self._open_btn.setToolTip("Open a recording for playback")
         self._open_btn.clicked.connect(self.open_clicked.emit)
         rec_layout.addWidget(self._record_btn)
+        rec_layout.addWidget(self._mic_btn)
         rec_layout.addWidget(self._open_btn)
         layout.addWidget(rec_row)
         self._update_record_btn_style()
+        self._update_mic_btn_style()
 
         # Time/Div
         lbl = QLabel("Time / Div")
@@ -564,6 +600,7 @@ class ControlsPanel(QWidget):
         for w in self._vscale_combos + self._toggle_btns + self._trig_btns:
             w.setEnabled(on)
         self._record_btn.setEnabled(on)
+        self._sync_mic_enabled()
         self._open_btn.setEnabled(True if not on else not self._recording)
         if on:
             self._update_trig_btn_styles()
@@ -571,11 +608,53 @@ class ControlsPanel(QWidget):
     def set_recording(self, on, path=""):
         self._recording = on
         self._open_btn.setEnabled(self._live and not on)
+        if not on:
+            self._mic_capture_ready = False
+            self._mic_btn.blockSignals(True)
+            self._mic_btn.setChecked(False)
+            self._mic_btn.blockSignals(False)
         if on:
             self._record_btn.setToolTip(path)
         else:
             self._record_btn.setToolTip("Record live traces to a local .hsrec file")
+        self._sync_mic_enabled()
         self._update_record_btn_style()
+        self._update_mic_btn_style()
+
+    def set_mic_capture_ready(self, on):
+        self._mic_capture_ready = bool(on) and self._recording
+        self._mic_btn.blockSignals(True)
+        self._mic_btn.setChecked(False)
+        self._mic_btn.blockSignals(False)
+        self._sync_mic_enabled()
+        self._update_mic_btn_style()
+
+    def set_mic_available(self, on):
+        self._mic_available = bool(on)
+        self._mic_btn.setVisible(self._mic_available)
+        self._sync_mic_enabled()
+
+    def _sync_mic_enabled(self):
+        self._mic_btn.setEnabled(
+            self._live and self._recording and self._mic_available and self._mic_capture_ready
+        )
+
+    def _on_mic_clicked(self):
+        self._update_mic_btn_style()
+        self.mic_muted_changed.emit(not self._mic_btn.isChecked())
+
+    def _update_mic_btn_style(self):
+        live = self._mic_btn.isChecked()
+        self._mic_btn.setIcon(self._mic_icon_live if live else self._mic_icon_muted)
+        self._mic_btn.setStyleSheet(_mode_btn_style(live))
+        if live:
+            self._mic_btn.setToolTip("Mute microphone")
+        elif self._recording and not self._mic_capture_ready:
+            self._mic_btn.setToolTip("Microphone unavailable")
+        elif not self._recording:
+            self._mic_btn.setToolTip("Unmute after starting a recording")
+        else:
+            self._mic_btn.setToolTip("Unmute microphone")
 
     def _update_record_btn_style(self):
         if self._recording:
