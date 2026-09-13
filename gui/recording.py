@@ -216,6 +216,12 @@ class AudioPlayer(QObject):
     def write(self, pcm, rate, channels):
         if not self._playing:
             return
+        if channels == 1:
+            n = len(pcm) // 2
+            if n <= 0:
+                return
+            pcm = np.repeat(np.frombuffer(pcm, dtype="<i2", count=n), 2).tobytes()
+            channels = 2
         if not self._ensure(rate, channels):
             return
         try:
