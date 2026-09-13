@@ -22,6 +22,7 @@ MEASURE_GROUPS = [
         ("vamp", "Amp", "Amplitude"),
         ("vmean", "Mean", "Mean"),
         ("vcycmean", "CMean", "Cycle Mean"),
+        ("vcycpkpk", "CMean PkPk", "Cycle Mean Peak to Peak"),
         ("vos_pos", "+OS", "Positive Overshoot"),
         ("vos_neg", "−OS", "Negative Overshoot"),
     ]),
@@ -425,6 +426,28 @@ def measure_vcycmean(samples, ns_per_sample):
     return float(y[start:end].mean())
 
 
+def measure_vcycpkpk(samples, ns_per_sample):
+    y = _finite_samples(samples)
+    if y is None or y.size < 4:
+        return None
+    levels = _hysteresis_levels(y)
+    if levels is None:
+        return None
+    low, high = levels
+    edges = _rising_edges(y, low, high)
+    if len(edges) < 2:
+        return None
+    pps = []
+    for i in range(len(edges) - 1):
+        seg = y[edges[i]:edges[i + 1]]
+        if seg.size < 2:
+            continue
+        pps.append(float(seg.max() - seg.min()))
+    if not pps:
+        return None
+    return float(np.mean(pps))
+
+
 def measure_vos_pos(samples, ns_per_sample):
     y = _finite_samples(samples)
     if y is None or y.size < 2:
@@ -463,6 +486,7 @@ _MEASURERS = {
     "rise": measure_rise,
     "fall": measure_fall,
     "vcycmean": measure_vcycmean,
+    "vcycpkpk": measure_vcycpkpk,
     "vos_pos": measure_vos_pos,
     "vos_neg": measure_vos_neg,
     "vpp": measure_vpp,
@@ -496,6 +520,7 @@ _FORMATTERS = {
     "vamp": format_volt,
     "vmiddle": format_volt,
     "vcycmean": format_volt,
+    "vcycpkpk": format_volt,
     "vos_pos": format_percent,
     "vos_neg": format_percent,
 }
